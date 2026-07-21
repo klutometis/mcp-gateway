@@ -1,74 +1,88 @@
-"""Tests for per-request identity forwarding (multi-tenant seam)."""
+"""Tests for per-request identity forwarding via W3C baggage (multi-tenant seam)."""
 
 from __future__ import annotations
 
 from fastmcp.server.providers.proxy import FastMCPProxy
 
 from mcp_gateway.identity import (
-    DEFAULT_IDENTITY_HEADER,
-    build_identity_headers,
+    BAGGAGE_HEADER,
+    DEFAULT_BAGGAGE_KEY,
+    build_baggage_header,
     identity_forwarding_client_factory,
     make_identity_forwarding_proxy,
 )
 
 
-# --- build_identity_headers -------------------------------------------------
+# --- build_baggage_header ---------------------------------------------------
 
 
-def test_build_headers_injects_identity():
-    h = build_identity_headers("group-abc")
-    assert h[DEFAULT_IDENTITY_HEADER] == "group-abc"
+def test_baggage_injects_identity():
+    h = build_baggage_header("group-abc")
+    assert h[BAGGAGE_HEADER] == f"{DEFAULT_BAGGAGE_KEY}=group-abc"
 
 
-def test_build_headers_custom_name_and_merge():
-    h = build_identity_headers(
-        "g1", header_name="X-User", base_headers={"Authorization": "Bearer x"}
+def test_baggage_custom_key():
+    h = build_baggage_header("acme", baggage_key="tenantId")
+    assert h[BAGGAGE_HEADER] == "tenantId=acme"
+
+
+def test_baggage_percent_encodes_value():
+    # emails contain '@'/'.' (legal) but separators must be escaped; encode all
+    h = build_baggage_header("peter@danenberg.name")
+    assert h[BAGGAGE_HEADER] == f"{DEFAULT_BAGGAGE_KEY}=peter%40danenberg.name"
+
+
+def test_baggage_omits_when_no_identity():
+    # unauthenticated / unresolved → no baggage entry leaks through
+    h = build_baggage_header(None, base_headers={"baggage": "userId=stale"})
+    assert BAGGAGE_HEADER not in h
+
+
+def test_baggage_preserves_other_members():
+    h = build_baggage_header(
+        "g1", base_headers={"baggage": "region=us-east-1,userId=old"}
     )
-    assert h == {"Authorization": "Bearer x", "X-User": "g1"}
+    # our key is refreshed (old dropped), other members preserved
+    assert "userId=g1" in h[BAGGAGE_HEADER]
+    assert "region=us-east-1" in h[BAGGAGE_HEADER]
+    assert "userId=old" not in h[BAGGAGE_HEADER]
 
 
-def test_build_headers_omits_when_no_identity():
-    # unauthenticated / unresolved → no identity header leaks through
-    h = build_identity_headers(None, base_headers={"X-Spark-Group-Id": "stale"})
-    assert DEFAULT_IDENTITY_HEADER not in h
-
-
-def test_build_headers_does_not_mutate_base():
-    base = {"a": "1"}
-    build_identity_headers("g", base_headers=base)
-    assert base == {"a": "1"}  # copy, not mutate
+def test_baggage_does_not_mutate_base():
+    base = {"baggage": "region=x"}
+    build_baggage_header("g", base_headers=base)
+    assert base == {"baggage": "region=x"}  # copy, not mutate
 
 
 # --- the per-request factory ------------------------------------------------
 
 
-def _transport_headers(client) -> dict:
-    # ProxyClient wraps a transport; StreamableHttpTransport exposes .headers
-    return dict(getattr(client.transport, "headers", {}))
+def _baggage(client) -> str:
+    return dict(getattr(client.transport, "headers", {})).get(BAGGAGE_HEADER, "")
 
 
 def test_factory_forwards_current_identity_per_call():
-    """The SAME factory must reflect whoever is calling *right now* — this is
-    the multi-tenant guarantee (user A's call carries A, user B's carries B)."""
+    """The SAME factory must reflect whoever is calling *right now* — the
+    multi-tenant guarantee (user A's call carries A, user B's carries B)."""
     current = {"id": None}
     factory = identity_forwarding_client_factory(
         "http://upstream.local/mcp", lambda: current["id"]
     )
 
     current["id"] = "user-A"
-    client_a = factory()
+    a = _baggage(factory())
     current["id"] = "user-B"
-    client_b = factory()
+    b = _baggage(factory())
 
-    assert _transport_headers(client_a).get(DEFAULT_IDENTITY_HEADER) == "user-A"
-    assert _transport_headers(client_b).get(DEFAULT_IDENTITY_HEADER) == "user-B"
+    assert a == f"{DEFAULT_BAGGAGE_KEY}=user-A"
+    assert b == f"{DEFAULT_BAGGAGE_KEY}=user-B"
 
 
-def test_factory_omits_header_when_unauthenticated():
+def test_factory_omits_baggage_when_unauthenticated():
     factory = identity_forwarding_client_factory(
         "http://upstream.local/mcp", lambda: None
     )
-    assert DEFAULT_IDENTITY_HEADER not in _transport_headers(factory())
+    assert _baggage(factory()) == ""
 
 
 def test_make_proxy_returns_fastmcp_proxy():
