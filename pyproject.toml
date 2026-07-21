@@ -1,0 +1,36 @@
+[project]
+name = "mcp-gateway"
+version = "0.1.0"
+description = "Generic MCP gateway: config-driven aggregation of multiple MCP servers (subset/rename, multi-instance routing, middleware, pluggable auth)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=2.12.0",
+    "pillow>=12.2.0",
+    "py-key-value-aio[disk]>=0.4.4",
+    "pyjwt>=2.10.1",
+    "python-dotenv>=1.0.0",
+    "uvicorn>=0.40.0",
+]
+
+[project.scripts]
+gateway-local = "mcp_gateway.local:main"
+gateway-remote = "mcp_gateway.remote:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_gateway"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+norecursedirs = ["tests/manual"]

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCP Gateway - OAuth-Protected MCP Server Aggregation</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            color: #333;
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+        }
+        .section {
+            margin-bottom: 30px;
+        }
+        .server-list {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            border-left: 4px solid #3498db;
+        }
+        .server-list ul {
+            margin: 10px 0;
+        }
+        footer {
+            margin-top: 50px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+            color: #666;
+            font-size: 0.9em;
+        }
+        a {
+            color: #3498db;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <h1>MCP Gateway</h1>
+    
+    <div class="section">
+        <p>
+            MCP Gateway is an OAuth-protected aggregation service for Model Context Protocol (MCP) servers.
+            It provides secure, authenticated access to multiple AI-enhanced services through a single endpoint.
+        </p>
+    </div>
+
+    <div class="section">
+        <h2>What is MCP?</h2>
+        <p>
+            The <a href="https://modelcontextprotocol.io" target="_blank">Model Context Protocol</a> (MCP) 
+            is an open protocol that enables AI applications to securely connect to external data sources and tools.
+            MCP Gateway aggregates multiple MCP servers, providing unified OAuth authentication and access control.
+        </p>
+    </div>
+
+    <div class="section">
+        <h2>Integrated Services</h2>
+        <div class="server-list">
+            <p>This gateway provides authenticated access to:</p>
+            <ul>
+                <li><strong>Context7</strong> - Library documentation and code examples lookup</li>
+                <li><strong>Firecrawl</strong> - Web scraping, crawling, and content extraction</li>
+                <li><strong>Linkup</strong> - Real-time web search with trusted sources</li>
+                <li><strong>Zep</strong> - Temporal knowledge graph memory</li>
+                <li><strong>Perplexity</strong> - Advanced AI search and reasoning</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Authentication & Security</h2>
+        <p>
+            Access to MCP Gateway is protected by Google OAuth 2.0 authentication. Users must authenticate
+            with their Google account and grant consent before accessing the aggregated MCP services.
+            All connections use HTTPS encryption to protect data in transit.
+        </p>
+    </div>
+
+    <div class="section">
+        <h2>Technical Architecture</h2>
+        <p>
+            MCP Gateway is built with <a href="https://github.com/jlowin/fastmcp" target="_blank">FastMCP</a>,
+            using stdio transport for efficient server-to-server communication. The gateway handles OAuth
+            flows, token management, and request routing to upstream MCP servers.
+        </p>
+    </div>
+
+    <footer>
+        <p>
+            <a href="/privacy">Privacy Policy</a> | 
+            <a href="/terms">Terms of Service</a>
+        </p>
+        <p>
+            MCP Gateway &copy; 2026. All rights reserved.
+        </p>
+    </footer>
+</body>
+</html>
