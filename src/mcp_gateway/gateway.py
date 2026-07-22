@@ -389,6 +389,7 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
             entry['forward_identity'] = {
                 'as': fi.get('as', 'baggage'),
                 'key': fi.get('key', 'userId'),
+                'name': fi.get('name', 'X-Spark-Group-Id'),
                 'from_claim': fi.get('from_claim', 'email'),
                 'sanitize': fi.get('sanitize'),
             }
@@ -676,10 +677,6 @@ def _build_single_instance(
     transport = server_config["transport"]
     fi = server_config.get("forward_identity")
     if fi and transport != "stdio":
-        if fi.get("as", "baggage") != "baggage":
-            raise ValueError(
-                f"forward_identity.as={fi.get('as')!r} unsupported; only 'baggage'"
-            )
         from mcp_gateway.identity import (
             claim_identity_resolver,
             make_identity_forwarding_proxy,
@@ -692,7 +689,9 @@ def _build_single_instance(
         proxy = make_identity_forwarding_proxy(
             server_config["url"],
             resolver,
+            carrier=fi.get("as", "baggage"),
             baggage_key=fi.get("key", "userId"),
+            header_name=fi.get("name", "X-Spark-Group-Id"),
             base_headers=server_config.get("headers", {}),
             name=f"Proxy-{name}",
         )

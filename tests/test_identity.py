@@ -11,7 +11,9 @@ from mcp_gateway.gateway import load_servers
 from mcp_gateway.identity import (
     BAGGAGE_HEADER,
     DEFAULT_BAGGAGE_KEY,
+    DEFAULT_IDENTITY_HEADER,
     build_baggage_header,
+    build_header_identity,
     claim_identity_resolver,
     identity_forwarding_client_factory,
     make_identity_forwarding_proxy,
@@ -97,6 +99,36 @@ def test_make_proxy_returns_fastmcp_proxy():
     assert isinstance(proxy, FastMCPProxy)
 
 
+# --- header carrier (coexistence with X-Spark-Group-Id upstreams) ----------
+
+
+def test_build_header_identity():
+    assert build_header_identity("g1")[DEFAULT_IDENTITY_HEADER] == "g1"
+    assert build_header_identity("g1", header_name="X-Tenant") == {"X-Tenant": "g1"}
+    assert DEFAULT_IDENTITY_HEADER not in build_header_identity(None)
+
+
+def test_factory_header_carrier_forwards_per_call():
+    current = {"id": None}
+    stamp = lambda ident, base: build_header_identity(ident, base_headers=base)
+    factory = identity_forwarding_client_factory(
+        "http://tools.local/mcp", lambda: current["id"], stamp=stamp
+    )
+    current["id"] = "user-A"
+    a = dict(getattr(factory().transport, "headers", {}))
+    current["id"] = "user-B"
+    b = dict(getattr(factory().transport, "headers", {}))
+    assert a.get(DEFAULT_IDENTITY_HEADER) == "user-A"
+    assert b.get(DEFAULT_IDENTITY_HEADER) == "user-B"
+
+
+def test_make_proxy_header_carrier():
+    proxy = make_identity_forwarding_proxy(
+        "http://tools.local/mcp", lambda: "g", carrier="header", name="tools"
+    )
+    assert isinstance(proxy, FastMCPProxy)
+
+
 # --- claim_identity_resolver (OAuth claim -> identity) ----------------------
 
 
@@ -141,4 +173,10 @@ def test_load_servers_parses_forward_identity(tmp_path):
     p.write_text(json.dumps(cfg))
     servers = load_servers(str(p))
     fi = servers["whatsapp"]["forward_identity"]
-    assert fi == {"as": "baggage", "key": "userId", "from_claim": "email", "sanitize": "safe"}
+    assert fi == {
+        "as": "baggage",
+        "key": "userId",
+        "name": "X-Spark-Group-Id",
+        "from_claim": "email",
+        "sanitize": "safe",
+    }

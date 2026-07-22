@@ -51,6 +51,7 @@ from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
 
 BAGGAGE_HEADER = "baggage"
 DEFAULT_BAGGAGE_KEY = "userId"
+DEFAULT_IDENTITY_HEADER = "X-Spark-Group-Id"
 
 # A resolver returns the caller's identity (e.g. group_id) for the current
 # request, or None if unauthenticated / not resolvable.
@@ -140,27 +141,50 @@ def build_baggage_header(
     return headers
 
 
+def build_header_identity(
+    identity: str | None,
+    *,
+    header_name: str = DEFAULT_IDENTITY_HEADER,
+    base_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Merge ``identity`` into a copy of ``base_headers`` as a plain header.
+
+    For upstreams that read a bespoke identity header (e.g. the existing
+    tools-server reads ``X-Spark-Group-Id``) rather than W3C baggage.
+    Falsy identity omits the header (no stale/empty identity leaks).
+    """
+    headers = dict(base_headers or {})
+    if identity:
+        headers[header_name] = identity
+    else:
+        headers.pop(header_name, None)
+    return headers
+
+
+# A stamp merges a resolved identity into a base header dict.
+HeaderStamp = Callable[["str | None", "dict[str, str] | None"], "dict[str, str]"]
+
+
 def identity_forwarding_client_factory(
     url: str,
     identity_resolver: IdentityResolver,
     *,
-    baggage_key: str = DEFAULT_BAGGAGE_KEY,
+    stamp: HeaderStamp | None = None,
     base_headers: dict[str, str] | None = None,
     proxy_client_kwargs: dict[str, Any] | None = None,
 ) -> Callable[[], ProxyClient]:
-    """Return a ``client_factory`` that stamps the caller's identity as
-    baggage per call.
+    """Return a ``client_factory`` that stamps the caller's identity per call.
 
-    Each invocation resolves the current caller's identity and builds a
-    fresh :class:`ProxyClient` over a streamable-HTTP transport carrying
-    that identity in the ``baggage`` header.
+    ``stamp`` decides *how* identity is carried (baggage vs plain header);
+    defaults to W3C baggage under the default key.
     """
+    if stamp is None:
+        def stamp(ident: str | None, base: dict[str, str] | None) -> dict[str, str]:
+            return build_baggage_header(ident, base_headers=base)
 
     def factory() -> ProxyClient:
         identity = identity_resolver()
-        headers = build_baggage_header(
-            identity, baggage_key=baggage_key, base_headers=base_headers
-        )
+        headers = stamp(identity, base_headers)
         transport = StreamableHttpTransport(url, headers=headers)
         return ProxyClient(transport, **(proxy_client_kwargs or {}))
 
@@ -171,22 +195,34 @@ def make_identity_forwarding_proxy(
     url: str,
     identity_resolver: IdentityResolver,
     *,
+    carrier: str = "baggage",
     baggage_key: str = DEFAULT_BAGGAGE_KEY,
+    header_name: str = DEFAULT_IDENTITY_HEADER,
     base_headers: dict[str, str] | None = None,
     name: str | None = None,
     proxy_client_kwargs: dict[str, Any] | None = None,
 ) -> FastMCPProxy:
-    """Build a multi-tenant proxy that forwards per-request identity upstream
-    as W3C ``baggage``.
+    """Build a multi-tenant proxy that forwards per-request identity upstream.
 
-    Mount the result into a gateway like any other proxy; the difference is
-    that every upstream call carries the *current* caller's identity instead
-    of a static one.
+    ``carrier`` selects how identity is carried:
+      - ``"baggage"`` (default): W3C ``baggage: <baggage_key>=<id>``.
+      - ``"header"``: a plain ``<header_name>: <id>`` (e.g. the existing
+        tools-server's ``X-Spark-Group-Id``) — for coexistence with
+        upstreams that predate baggage.
     """
+    if carrier == "baggage":
+        def stamp(ident: str | None, base: dict[str, str] | None) -> dict[str, str]:
+            return build_baggage_header(ident, baggage_key=baggage_key, base_headers=base)
+    elif carrier == "header":
+        def stamp(ident: str | None, base: dict[str, str] | None) -> dict[str, str]:
+            return build_header_identity(ident, header_name=header_name, base_headers=base)
+    else:
+        raise ValueError(f"carrier must be 'baggage' or 'header', got {carrier!r}")
+
     factory = identity_forwarding_client_factory(
         url,
         identity_resolver,
-        baggage_key=baggage_key,
+        stamp=stamp,
         base_headers=base_headers,
         proxy_client_kwargs=proxy_client_kwargs,
     )
