@@ -687,12 +687,12 @@ def _build_single_instance(
             sanitize=fi.get("sanitize"),
         )
         proxy = make_identity_forwarding_proxy(
-            server_config["url"],
+            _expand_env(server_config["url"]),
             resolver,
             carrier=fi.get("as", "baggage"),
             baggage_key=fi.get("key", "userId"),
             header_name=fi.get("name", "X-Spark-Group-Id"),
-            base_headers=server_config.get("headers", {}),
+            base_headers=_expand_headers(server_config.get("headers", {})),
             name=f"Proxy-{name}",
         )
         if tool_configs != "*":
