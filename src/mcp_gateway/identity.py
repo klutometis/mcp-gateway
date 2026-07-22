@@ -40,11 +40,13 @@ identity is or *how* it's authenticated — the consumer supplies the
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
 from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
 
 BAGGAGE_HEADER = "baggage"
@@ -53,6 +55,45 @@ DEFAULT_BAGGAGE_KEY = "userId"
 # A resolver returns the caller's identity (e.g. group_id) for the current
 # request, or None if unauthenticated / not resolvable.
 IdentityResolver = Callable[[], str | None]
+
+# Named value sanitizers. "safe" maps to a DNS/graphiti-safe id: anything
+# outside [A-Za-z0-9_-] becomes '-'. (matches mneme's emailToGroupId.)
+SANITIZERS: dict[str, Callable[[str], str]] = {
+    "safe": lambda v: re.sub(r"[^a-zA-Z0-9_-]", "-", v),
+}
+
+
+def claim_identity_resolver(
+    from_claim: str = "email",
+    *,
+    sanitize: str | None = None,
+) -> IdentityResolver:
+    """Resolve the caller's identity from an OAuth access-token claim.
+
+    Reads ``from_claim`` off the authenticated request's access token
+    (e.g. ``email``/``sub``), optionally passing it through a named
+    sanitizer (e.g. ``"safe"`` -> a DNS/graphiti-safe id). Returns None
+    when unauthenticated / claim absent. This is the resolver a gateway
+    hands to ``make_identity_forwarding_proxy`` for OAuth-authenticated
+    upstreams.
+    """
+    fn = SANITIZERS.get(sanitize) if sanitize else None
+
+    def resolve() -> str | None:
+        try:
+            tok = get_access_token()
+        except Exception:
+            return None
+        if tok is None:
+            return None
+        claims = getattr(tok, "claims", None) or {}
+        val = claims.get(from_claim)
+        if not val:
+            return None
+        val = str(val)
+        return fn(val) if fn else val
+
+    return resolve
 
 
 def _encode_baggage_value(value: str) -> str:

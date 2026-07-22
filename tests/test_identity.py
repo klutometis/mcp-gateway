@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
+
 from fastmcp.server.providers.proxy import FastMCPProxy
 
+from mcp_gateway import identity as idmod
+from mcp_gateway.gateway import load_servers
 from mcp_gateway.identity import (
     BAGGAGE_HEADER,
     DEFAULT_BAGGAGE_KEY,
     build_baggage_header,
+    claim_identity_resolver,
     identity_forwarding_client_factory,
     make_identity_forwarding_proxy,
 )
@@ -90,3 +95,50 @@ def test_make_proxy_returns_fastmcp_proxy():
         "http://upstream.local/mcp", lambda: "g", name="zep"
     )
     assert isinstance(proxy, FastMCPProxy)
+
+
+# --- claim_identity_resolver (OAuth claim -> identity) ----------------------
+
+
+class _Tok:
+    def __init__(self, claims):
+        self.claims = claims
+
+
+def test_claim_resolver_reads_and_sanitizes(monkeypatch):
+    monkeypatch.setattr(idmod, "get_access_token", lambda: _Tok({"email": "peter@danenberg.name"}))
+    assert claim_identity_resolver("email", sanitize="safe")() == "peter-danenberg-name"
+
+
+def test_claim_resolver_raw(monkeypatch):
+    monkeypatch.setattr(idmod, "get_access_token", lambda: _Tok({"sub": "abc123"}))
+    assert claim_identity_resolver("sub")() == "abc123"
+
+
+def test_claim_resolver_none_when_unauthenticated(monkeypatch):
+    monkeypatch.setattr(idmod, "get_access_token", lambda: None)
+    assert claim_identity_resolver("email")() is None
+
+
+def test_claim_resolver_none_when_claim_missing(monkeypatch):
+    monkeypatch.setattr(idmod, "get_access_token", lambda: _Tok({}))
+    assert claim_identity_resolver("email")() is None
+
+
+# --- servers.json forward_identity parsing ---------------------------------
+
+
+def test_load_servers_parses_forward_identity(tmp_path):
+    cfg = {
+        "whatsapp": {
+            "transport": "streamable-http",
+            "url": "http://whatsapp.railway.internal:8080/mcp",
+            "forward_identity": {"as": "baggage", "key": "userId", "from_claim": "email", "sanitize": "safe"},
+            "tools": "*",
+        }
+    }
+    p = tmp_path / "servers.json"
+    p.write_text(json.dumps(cfg))
+    servers = load_servers(str(p))
+    fi = servers["whatsapp"]["forward_identity"]
+    assert fi == {"as": "baggage", "key": "userId", "from_claim": "email", "sanitize": "safe"}

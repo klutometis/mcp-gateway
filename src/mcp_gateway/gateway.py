@@ -380,6 +380,18 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
             'transport': transport,
             'tools': tools,
         }
+        # Per-request identity forwarding (multi-tenant). When present, the
+        # gateway resolves the authenticated caller's identity from an OAuth
+        # claim and stamps it as W3C baggage on every upstream call. See
+        # identity.py + notes/identity-propagation.md.
+        if 'forward_identity' in cfg:
+            fi = cfg['forward_identity']
+            entry['forward_identity'] = {
+                'as': fi.get('as', 'baggage'),
+                'key': fi.get('key', 'userId'),
+                'from_claim': fi.get('from_claim', 'email'),
+                'sanitize': fi.get('sanitize'),
+            }
         if transport == 'stdio':
             entry['command'] = cfg['command']
             entry['args'] = list(cfg.get('args', []))
@@ -655,8 +667,40 @@ def _build_single_instance(
     tool_configs: dict[str, ToolTransformConfig],
     create_proxy,
 ) -> FastMCP:
-    """Build a regular (pre-multi-instance) proxy. Behavior unchanged."""
+    """Build a regular (pre-multi-instance) proxy.
+
+    If the server declares ``forward_identity`` (baggage), build an
+    identity-forwarding proxy that stamps the caller's identity per request
+    instead of a static-header proxy.
+    """
     transport = server_config["transport"]
+    fi = server_config.get("forward_identity")
+    if fi and transport != "stdio":
+        if fi.get("as", "baggage") != "baggage":
+            raise ValueError(
+                f"forward_identity.as={fi.get('as')!r} unsupported; only 'baggage'"
+            )
+        from mcp_gateway.identity import (
+            claim_identity_resolver,
+            make_identity_forwarding_proxy,
+        )
+
+        resolver = claim_identity_resolver(
+            from_claim=fi.get("from_claim", "email"),
+            sanitize=fi.get("sanitize"),
+        )
+        proxy = make_identity_forwarding_proxy(
+            server_config["url"],
+            resolver,
+            baggage_key=fi.get("key", "userId"),
+            base_headers=server_config.get("headers", {}),
+            name=f"Proxy-{name}",
+        )
+        if tool_configs != "*":
+            proxy.enable(names=set(tool_configs.keys()), components={"tool"}, only=True)
+            proxy.add_transform(ToolTransform(tool_configs))
+        return proxy
+
     if transport == "stdio":
         proxy_config = _proxy_config_for_stdio(server_config)
     else:
