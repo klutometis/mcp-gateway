@@ -86,7 +86,11 @@ def main() -> None:
     else:
         base_url = f"https://{domain}"
 
-    # Configure Google OAuth
+    # Configure Google OAuth. Scopes are env-configurable so a deployment can
+    # request additional Google scopes (e.g. Gmail/Drive/Calendar) when it
+    # fronts an upstream that forwards the caller's token to Google APIs.
+    # Defaults to the minimal identity set.
+    scope = os.environ.get("MCP_OIDC_SCOPES", "openid email").strip() or "openid email"
     auth = StableRefreshGoogleProvider(
         client_id=client_id,
         client_secret=client_secret,
@@ -94,7 +98,7 @@ def main() -> None:
         extra_authorize_params={
             "access_type": "offline",
             "prompt": "consent",
-            "scope": "openid email",
+            "scope": scope,
         },
     )
 
