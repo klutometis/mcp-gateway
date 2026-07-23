@@ -185,6 +185,17 @@ def identity_forwarding_client_factory(
     def factory() -> ProxyClient:
         identity = identity_resolver()
         headers = stamp(identity, base_headers)
+        # FastMCP's ProxyProvider force-enables forward_incoming_headers, which
+        # merges the caller's inbound auth as ``get_http_headers({"authorization"})
+        # | self.headers``. get_http_headers yields a lowercase ``authorization``
+        # key; if our upstream credential is under ``Authorization`` (capitalized)
+        # BOTH survive the dict-union and the caller's token can win, breaking
+        # upstream auth. Normalize our auth key to lowercase so it collides with
+        # and overrides the forwarded one.
+        headers = {
+            ("authorization" if k.lower() == "authorization" else k): v
+            for k, v in headers.items()
+        }
         transport = StreamableHttpTransport(url, headers=headers)
         return ProxyClient(transport, **(proxy_client_kwargs or {}))
 
