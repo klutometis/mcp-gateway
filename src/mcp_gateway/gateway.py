@@ -393,6 +393,10 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
                 'from_claim': fi.get('from_claim', 'email'),
                 'sanitize': fi.get('sanitize'),
             }
+        # Per-request token forwarding: forward the caller's own Authorization
+        # (e.g. a Google access token) to a token-consumer upstream.
+        if cfg.get('forward_token'):
+            entry['forward_token'] = True
         if transport == 'stdio':
             entry['command'] = cfg['command']
             entry['args'] = list(cfg.get('args', []))
