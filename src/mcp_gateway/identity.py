@@ -273,17 +273,18 @@ def token_forwarding_client_factory(
             at = get_access_token()
             tok = at.token if at else None
         except Exception as e:
-            _log.info("forward_token: get_access_token raised: %s", e)
+            print(f"forward_token: get_access_token raised: {e}", flush=True)
         raw = None
         try:
             incoming = get_http_headers(include={"authorization"})
             raw = incoming.get("authorization") if incoming else None
         except Exception as e:
-            _log.info("forward_token: get_http_headers raised: %s", e)
-        _log.info(
-            "forward_token probe: access_token=%s token=%s http_authz=%s",
-            bool(at), (tok[:12] + "…") if tok else None,
-            (raw[:19] + "…") if raw else None,
+            print(f"forward_token: get_http_headers raised: {e}", flush=True)
+        print(
+            f"forward_token probe: access_token={bool(at)} "
+            f"token={(tok[:12] + '…') if tok else None} "
+            f"http_authz={(raw[:19] + '…') if raw else None}",
+            flush=True,
         )
         if not tok and raw:
             headers["authorization"] = raw
