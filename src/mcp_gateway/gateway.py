@@ -682,6 +682,8 @@ def _build_single_instance(
     if server_config.get("forward_token") and transport != "stdio":
         from mcp_gateway.identity import make_token_forwarding_proxy
 
+        print(f"[gateway] building forward_token proxy for {name!r}", flush=True)
+
         proxy = make_token_forwarding_proxy(
             _expand_env(server_config["url"]),
             base_headers=_expand_headers(server_config.get("headers", {})),
