@@ -40,6 +40,7 @@ identity is or *how* it's authenticated — the consumer supplies the
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from typing import Any
@@ -48,6 +49,8 @@ from urllib.parse import quote
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
+
+_log = logging.getLogger("mcp_gateway.identity")
 
 BAGGAGE_HEADER = "baggage"
 DEFAULT_BAGGAGE_KEY = "userId"
@@ -265,20 +268,25 @@ def token_forwarding_client_factory(
         # call scope (get_http_headers() is NOT — it comes back empty here).
         # Fall back to the raw inbound Authorization if present.
         tok = None
+        at = None
         try:
             at = get_access_token()
             tok = at.token if at else None
-        except Exception:
-            tok = None
-        if not tok:
-            try:
-                incoming = get_http_headers(include={"authorization"})
-            except Exception:
-                incoming = {}
+        except Exception as e:
+            _log.info("forward_token: get_access_token raised: %s", e)
+        raw = None
+        try:
+            incoming = get_http_headers(include={"authorization"})
             raw = incoming.get("authorization") if incoming else None
-            if raw:
-                headers["authorization"] = raw
-                tok = None  # already a full header
+        except Exception as e:
+            _log.info("forward_token: get_http_headers raised: %s", e)
+        _log.info(
+            "forward_token probe: access_token=%s token=%s http_authz=%s",
+            bool(at), (tok[:12] + "…") if tok else None,
+            (raw[:19] + "…") if raw else None,
+        )
+        if not tok and raw:
+            headers["authorization"] = raw
         if tok:
             headers["authorization"] = f"Bearer {tok}"
         elif "authorization" not in headers:
