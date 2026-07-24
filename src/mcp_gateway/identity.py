@@ -259,15 +259,29 @@ def token_forwarding_client_factory(
 
     def factory() -> ProxyClient:
         headers = dict(base_headers or {})
+        # Prefer the validated access token from the auth context: for an
+        # OAuthProxy upstream this is the swapped-in upstream (Google) token,
+        # and get_access_token() is populated inside the proxy factory at
+        # call scope (get_http_headers() is NOT — it comes back empty here).
+        # Fall back to the raw inbound Authorization if present.
+        tok = None
         try:
-            incoming = get_http_headers(include={"authorization"})
+            at = get_access_token()
+            tok = at.token if at else None
         except Exception:
-            incoming = {}
-        auth = incoming.get("authorization") if incoming else None
-        if auth:
-            headers["authorization"] = auth
-        else:
-            headers.pop("authorization", None)
+            tok = None
+        if not tok:
+            try:
+                incoming = get_http_headers(include={"authorization"})
+            except Exception:
+                incoming = {}
+            raw = incoming.get("authorization") if incoming else None
+            if raw:
+                headers["authorization"] = raw
+                tok = None  # already a full header
+        if tok:
+            headers["authorization"] = f"Bearer {tok}"
+        elif "authorization" not in headers:
             headers.pop("Authorization", None)
         transport = StreamableHttpTransport(url, headers=headers)
         return ProxyClient(transport, **(proxy_client_kwargs or {}))
