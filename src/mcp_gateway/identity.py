@@ -46,7 +46,7 @@ from typing import Any
 from urllib.parse import quote
 
 from fastmcp.client.transports import StreamableHttpTransport
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp.server.providers.proxy import FastMCPProxy, ProxyClient
 
 BAGGAGE_HEADER = "baggage"
@@ -238,3 +238,59 @@ def make_identity_forwarding_proxy(
         proxy_client_kwargs=proxy_client_kwargs,
     )
     return FastMCPProxy(client_factory=factory, name=name or f"identity-proxy:{url}")
+
+
+def token_forwarding_client_factory(
+    url: str,
+    *,
+    base_headers: dict[str, str] | None = None,
+    proxy_client_kwargs: dict[str, Any] | None = None,
+) -> Callable[[], ProxyClient]:
+    """Return a ``client_factory`` that forwards the caller's inbound
+    ``Authorization`` to the upstream, explicitly, per request.
+
+    FastMCP's implicit ``forward_incoming_headers`` only reliably fires for
+    the identity/baggage proxy path; the plain proxy path leaves the upstream
+    with no auth (observed: sidecars saw ``auth=<none>``). This factory does
+    it deterministically — read the current request's ``authorization`` via
+    ``get_http_headers`` and stamp it on the upstream transport. For upstreams
+    that consume the caller's token directly (e.g. Google token-consumers).
+    """
+
+    def factory() -> ProxyClient:
+        headers = dict(base_headers or {})
+        try:
+            incoming = get_http_headers(include={"authorization"})
+        except Exception:
+            incoming = {}
+        auth = incoming.get("authorization") if incoming else None
+        if auth:
+            headers["authorization"] = auth
+        else:
+            headers.pop("authorization", None)
+            headers.pop("Authorization", None)
+        transport = StreamableHttpTransport(url, headers=headers)
+        return ProxyClient(transport, **(proxy_client_kwargs or {}))
+
+    return factory
+
+
+def make_token_forwarding_proxy(
+    url: str,
+    *,
+    base_headers: dict[str, str] | None = None,
+    name: str | None = None,
+    proxy_client_kwargs: dict[str, Any] | None = None,
+) -> FastMCPProxy:
+    """Build a proxy that forwards the caller's ``Authorization`` upstream.
+
+    For upstreams that are token-consumers of the caller's own credential
+    (e.g. a Google access token). Distinct from the baggage/identity proxy,
+    which forwards a derived claim rather than the raw token.
+    """
+    factory = token_forwarding_client_factory(
+        url,
+        base_headers=base_headers,
+        proxy_client_kwargs=proxy_client_kwargs,
+    )
+    return FastMCPProxy(client_factory=factory, name=name or f"token-proxy:{url}")

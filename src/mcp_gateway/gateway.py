@@ -675,6 +675,23 @@ def _build_single_instance(
     instead of a static-header proxy.
     """
     transport = server_config["transport"]
+
+    # forward_token: forward the caller's own Authorization (e.g. a Google
+    # access token) to a token-consumer upstream. Explicit + reliable, unlike
+    # FastMCP's implicit forward_incoming_headers on the plain proxy path.
+    if server_config.get("forward_token") and transport != "stdio":
+        from mcp_gateway.identity import make_token_forwarding_proxy
+
+        proxy = make_token_forwarding_proxy(
+            _expand_env(server_config["url"]),
+            base_headers=_expand_headers(server_config.get("headers", {})),
+            name=f"Proxy-{name}",
+        )
+        if tool_configs != "*":
+            proxy.enable(names=set(tool_configs.keys()), components={"tool"}, only=True)
+            proxy.add_transform(ToolTransform(tool_configs))
+        return proxy
+
     fi = server_config.get("forward_identity")
     if fi and transport != "stdio":
         from mcp_gateway.identity import (
