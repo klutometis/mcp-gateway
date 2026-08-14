@@ -7,6 +7,10 @@ to exercise the wrapper's routing + schema-mutation logic.
 
 from __future__ import annotations
 
+import asyncio
+import socket
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -247,6 +251,118 @@ class TestMultiInstanceProxy:
     async def test_empty_instances_raises(self) -> None:
         with pytest.raises(ValueError):
             MultiInstanceProxy("x", instances={}, param_name="account")
+
+
+# ---------------------------------------------------------------------------
+# Unreachable backings: the "Unknown tool" masking bug
+# ---------------------------------------------------------------------------
+
+
+class TestUnreachableBackend:
+    """A dead upstream must not be reported as a nonexistent tool.
+
+    Regression cover for a real incident: the chrome sidecars reach the
+    cloudtop gateway over an SSH RemoteForward. The forward died; every
+    chrome call came back ``NotFoundError: Unknown tool:
+    'chrome_list_pages'`` with a list of other configured profiles
+    appended, which reads as a tool-registration/config bug. Two agents
+    spent a session in servers.json. Nothing was misconfigured; the
+    tunnel was down.
+    """
+
+    async def test_dead_port_reports_unreachable_not_unknown_tool(self) -> None:
+        dead_url = f"http://127.0.0.1:{_closed_port()}/mcp"
+        wrapper = MultiInstanceProxy(
+            "chrome",
+            instances={
+                "personal": _make_backing("personal", send_fails=True),
+                "work": _make_backing("work"),
+            },
+            param_name="profile",
+            instance_urls={"personal": dead_url},
+        )
+        with pytest.raises(ToolError) as excinfo:
+            await wrapper.call_tool(
+                "send", {"profile": "personal", "to": "x@y", "message": "hi"}
+            )
+        msg = str(excinfo.value)
+        assert "unreachable" in msg.lower(), "must name the actual failure mode"
+        assert dead_url in msg, "must say which endpoint is dead"
+        assert "not a bad argument" in msg, (
+            "must tell the caller retrying elsewhere won't help"
+        )
+        assert "Unknown tool" not in msg, (
+            "must not parrot FastMCP's misleading NotFoundError text"
+        )
+
+    async def test_live_backing_still_reports_the_real_error(self) -> None:
+        """A reachable backing that raises keeps the ordinary enriched error.
+
+        The probe must not swallow genuine tool failures: here the URL
+        points at something that *is* listening, so the underlying
+        message has to survive.
+        """
+        async with _listening_port() as url:
+            wrapper = MultiInstanceProxy(
+                "gmail",
+                instances={
+                    "personal": _make_backing("personal", send_fails=True),
+                    "work": _make_backing("work"),
+                },
+                param_name="account",
+                instance_urls={"personal": url},
+            )
+            with pytest.raises(ToolError) as excinfo:
+                await wrapper.call_tool(
+                    "send", {"account": "personal", "to": "x@y", "message": "hi"}
+                )
+            msg = str(excinfo.value)
+            assert "broken" in msg, "underlying error must survive the probe"
+            assert "unreachable" not in msg.lower()
+
+    async def test_no_url_configured_falls_back(self) -> None:
+        """stdio instances have no URL; behavior is unchanged for them."""
+        wrapper = MultiInstanceProxy(
+            "gmail",
+            instances={"personal": _make_backing("personal", send_fails=True)},
+            param_name="account",
+        )
+        with pytest.raises(ToolError) as excinfo:
+            await wrapper.call_tool(
+                "send", {"account": "personal", "to": "x@y", "message": "hi"}
+            )
+        assert "broken" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _closed_port() -> int:
+    """A port number nothing is listening on.
+
+    Bind, read the kernel-assigned port, close. Racy in principle;
+    in practice the kernel does not immediately hand the same
+    ephemeral port to someone else.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+@asynccontextmanager
+async def _listening_port() -> AsyncIterator[str]:
+    """A URL whose host:port accepts TCP connections and says nothing."""
+    server = await asyncio.start_server(
+        lambda r, w: w.close(), "127.0.0.1", 0
+    )
+    port = server.sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}/mcp"
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 # ---------------------------------------------------------------------------

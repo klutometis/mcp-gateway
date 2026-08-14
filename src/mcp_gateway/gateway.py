@@ -332,6 +332,12 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
     path:
         Path to the servers JSON file. If "None", reads the
         "MCP_SERVERS_FILE" environment variable, which is required.
+        That variable may name several files separated by ``os.pathsep``,
+        layered left to right the way ``PATH`` is: a later file may add
+        servers, or replace one of the same name outright. This lets a
+        deployment split its stack across repositories -- public server
+        definitions here, and any that name internal hosts or binaries
+        in a private repo -- without either file knowing about the other.
 
     Returns
     -------
@@ -350,14 +356,22 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
                 "MCP_SERVERS_FILE env var not set and no path passed. "
                 "Each deployment owns its servers.json; see deploy/*/README.md."
             )
-        path = Path(env_path)
-    path = Path(path)
+        path = env_path
 
-    with path.open() as f:
-        raw = json.load(f)
+    raw: dict[str, Any] = {}
+    for part in str(path).split(os.pathsep):
+        if not part:
+            continue
+        with Path(part).open() as f:
+            raw.update(json.load(f))
 
     servers: dict[str, dict[str, Any]] = {}
     for name, cfg in raw.items():
+        # JSON has no comments, so a top-level "_..." key is how a
+        # servers.json explains itself -- notably why a curated file
+        # omits the tools it omits, which is invisible otherwise.
+        if name.startswith('_'):
+            continue
         transport = cfg.get('transport', 'stdio')
         # A server may set "tools": "*" to expose ALL upstream tools
         # verbatim (no subsetting, no rename). Otherwise "tools" is a
@@ -586,24 +600,50 @@ def _proxy_config_for_stdio(
     renamed-from-host keys (e.g. subprocess GMAIL_OAUTH_PATH reads host
     GMAIL_OAUTH_PATH_PERSONAL). Per-instance ``env_keys`` are also
     passed through with original names.
+
+    ``env_keys`` is *forward-if-present*: unset vars are skipped, not
+    forwarded as None. The MCP SDK hands a stdio child only HOME/PATH/
+    SHELL/TERM/USER/LOGNAME, so every other var must be listed here --
+    which means the list is also the natural place to declare *optional*
+    host-specific overrides (VOICE_INDEX, VOICE_MODEL, ...). Forwarding
+    None instead makes StdioServerParameters fail pydantic validation and
+    takes the whole server down, so an unset optional var used to kill a
+    server that would otherwise have run happily on its own defaults.
     """
-    env: dict[str, Any] = {
-        k: os.environ.get(k) for k in server_config.get("env_keys", [])
-    }
+
+    def _put(env: dict[str, Any], key: str, host_key: str) -> None:
+        value = os.environ.get(host_key)
+        if value is None:
+            logger.debug(
+                "env_keys: %s unset; leaving it to the child's own default",
+                host_key,
+            )
+            return
+        env[key] = value
+
+    env: dict[str, Any] = {}
+    for key in server_config.get("env_keys", []):
+        _put(env, key, key)
     if instance_overrides:
         for sub_key in instance_overrides.get("env_keys", []):
-            env[sub_key] = os.environ.get(sub_key)
+            _put(env, sub_key, sub_key)
         for sub_key, host_key in instance_overrides.get("env_map", {}).items():
-            env[sub_key] = os.environ.get(host_key)
+            _put(env, sub_key, host_key)
     args = list(server_config["args"])
     if instance_overrides:
         if instance_overrides.get("args") is not None:
             args = list(instance_overrides["args"])
         else:
             args = args + list(instance_overrides.get("args_append", []))
+    # Interpolate ${VAR} in command/args, exactly as url/headers already do.
+    # Without this a stdio server cannot say where it lives without hardcoding
+    # an absolute path, so every host whose $HOME differs -- e.g. a corp box at
+    # /usr/local/google/home/danenberg -- has to keep a private edit of this
+    # committed file forever. That is a permanent merge conflict, not a config.
+    # Unset vars expand to empty (and log), same as the url/headers path.
     return {
-        "command": server_config["command"],
-        "args": args,
+        "command": _expand_env(server_config["command"]),
+        "args": [_expand_env(a) if isinstance(a, str) else a for a in args],
         "transport": "stdio",
         "env": env,
     }
@@ -613,8 +653,13 @@ def _expand_env(value: str) -> str:
     """Interpolate ``${VAR}`` references in a string from ``os.environ``.
 
     Lets ``servers.json`` reference secrets (e.g. upstream bearer tokens)
-    by name instead of hardcoding them in the committed config. An unset
-    variable expands to empty string (and is logged).
+    and host-dependent paths (``${HOME}``) by name instead of hardcoding
+    them in the committed config. An unset variable expands to empty
+    string (and is logged).
+
+    Note the pattern is ``${VAR}`` only: bare ``$VAR`` and shell defaults
+    like ``${VAR:-fallback}`` are deliberately left alone, so entries that
+    run through ``bash -c`` keep doing their own expansion.
     """
     import re
 
@@ -622,7 +667,7 @@ def _expand_env(value: str) -> str:
         var = m.group(1)
         val = os.environ.get(var)
         if val is None:
-            logger.warning("servers.json header references unset env var %s", var)
+            logger.warning("servers.json references unset env var %s", var)
             return ""
         return val
 
@@ -674,9 +719,12 @@ def _build_single_instance(
 ) -> FastMCP:
     """Build a regular (pre-multi-instance) proxy.
 
-    If the server declares ``forward_identity`` (baggage), build an
-    identity-forwarding proxy that stamps the caller's identity per request
-    instead of a static-header proxy.
+    Three shapes, in order. A server declaring ``forward_token`` gets a proxy
+    that passes the caller's own Authorization upstream; one declaring
+    ``forward_identity`` gets a proxy that resolves the caller and stamps them
+    per request, rather than a header fixed at startup. Neither applies to
+    stdio, which has no caller to speak of. Everything else is the plain
+    static-header proxy.
     """
     transport = server_config["transport"]
 
@@ -685,8 +733,6 @@ def _build_single_instance(
     # FastMCP's implicit forward_incoming_headers on the plain proxy path.
     if server_config.get("forward_token") and transport != "stdio":
         from mcp_gateway.identity import make_token_forwarding_proxy
-
-        print(f"[gateway] building forward_token proxy for {name!r}", flush=True)
 
         proxy = make_token_forwarding_proxy(
             _expand_env(server_config["url"]),
@@ -698,6 +744,8 @@ def _build_single_instance(
             proxy.add_transform(ToolTransform(tool_configs))
         return proxy
 
+    # forward_identity: stamp the caller's resolved identity on every upstream
+    # call, instead of a static header fixed at startup.
     fi = server_config.get("forward_identity")
     if fi and transport != "stdio":
         from mcp_gateway.identity import (
@@ -764,6 +812,10 @@ def _build_multi_instance(
     param_name = server_config["param_name"]
 
     backings: dict[str, FastMCP] = {}
+    # Post-expansion upstream URLs, handed to the wrapper so a failed call
+    # can be diagnosed as "nothing is listening there" rather than reported
+    # as an unknown tool. stdio instances contribute no entry.
+    instance_urls: dict[str, str] = {}
     for inst_name, inst_cfg in instances_cfg.items():
         if transport == "stdio":
             proxy_config = _proxy_config_for_stdio(
@@ -773,6 +825,9 @@ def _build_multi_instance(
             proxy_config = _proxy_config_for_http(
                 server_config, instance_overrides=inst_cfg
             )
+            url = proxy_config.get("url")
+            if isinstance(url, str) and url:
+                instance_urls[inst_name] = url
         backing = create_proxy(
             {"mcpServers": {"default": proxy_config}},
             name=f"Proxy-{name}-{inst_name}",
@@ -795,6 +850,7 @@ def _build_multi_instance(
         name=f"MultiInstance-{name}",
         instances=backings,
         param_name=param_name,
+        instance_urls=instance_urls,
     )
 
 

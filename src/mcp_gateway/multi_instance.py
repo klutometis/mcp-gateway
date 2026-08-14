@@ -24,6 +24,13 @@ Key behaviors:
   the corresponding backing proxy, delegates. Missing/unknown/failed
   cases raise ToolError with the configured set in the message so the
   model can self-correct in one round-trip.
+- Failed calls are triaged before they are reported: if the backing's
+  URL refuses a TCP connection, the error says the backend is
+  unreachable instead of parroting FastMCP's ``NotFoundError: Unknown
+  tool``. An unreachable upstream and a misspelled tool name are
+  indistinguishable at the proxy layer, and conflating them cost a
+  debugging session once (chrome tunnel down, error read as a
+  tool-registration bug).
 - Single-instance edge case: if exactly one instance is configured and
   the agent omits the param, use it (single-instance setups feel
   identical to today).
@@ -42,8 +49,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Sequence
+from contextlib import suppress
 from copy import deepcopy
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -51,6 +60,12 @@ from fastmcp.tools.function_tool import FunctionTool
 from fastmcp.tools.tool import Tool, ToolResult
 
 log = logging.getLogger(__name__)
+
+# Seconds to wait for a backing's TCP port to accept a connection when
+# diagnosing a failed call. Only ever spent on a call that already failed,
+# and these backings are localhost or a localhost-forwarded port, so a
+# generous-feeling timeout is still cheap.
+_PROBE_TIMEOUT = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +166,77 @@ def _backend_failed_error(
     )
 
 
+def _backend_unreachable_error(
+    tool_name: str,
+    param_name: str,
+    instance: str,
+    url: str,
+    reason: str,
+) -> ToolError:
+    """Error for "the backing process isn't answering", as distinct from
+    "the tool doesn't exist".
+
+    Deliberately says nothing about other instances: when the transport
+    is down, the configured-set boilerplate is noise at best and a
+    false lead at worst (see ``_diagnose_unreachable``).
+    """
+    return ToolError(
+        f"Backend for {param_name}={instance!r} is unreachable at {url} "
+        f"({reason}), so {tool_name!r} could not be called. The tool exists "
+        f"and the {param_name} is spelled correctly; the process serving it "
+        f"is down or its tunnel is dead. This is an infrastructure failure, "
+        f"not a bad argument — retrying with a different {param_name} will "
+        f"not help."
+    )
+
+
+async def _probe_reachable(url: str, timeout: float = _PROBE_TIMEOUT) -> str | None:
+    """Return None if ``url``'s host:port accepts a TCP connection, else why not.
+
+    A bare TCP connect, not an HTTP request: it is protocol-agnostic
+    (every backing speaks *something* over TCP), it cannot be fooled by
+    an app-level 404, and it costs a round-trip on localhost. That is
+    all we need to separate "nothing is listening" from "something is
+    listening and gave a real answer".
+    """
+    parsed = urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        return None  # Not a URL we can probe; don't guess.
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        fut = asyncio.open_connection(host, port)
+        _reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        return f"no response from {host}:{port} within {timeout:g}s"
+    except OSError as e:
+        # ConnectionRefusedError is the interesting one: port closed.
+        return f"cannot connect to {host}:{port}: {e.strerror or e}"
+    writer.close()
+    with suppress(Exception):
+        await writer.wait_closed()
+    return None
+
+
+async def _diagnose_unreachable(url: str | None) -> str | None:
+    """Reason string if ``url`` looks dead, else None.
+
+    Why this exists: FastMCP's proxy provider catches connection
+    failures inside ``get_tool()``, logs a warning, and returns None —
+    so the caller raises ``NotFoundError: Unknown tool: 'x'``. A dead
+    TCP tunnel therefore presents as a nonexistent tool, and the
+    reader goes hunting through config for a tool-registration bug
+    that does not exist. One connect() tells the two apart.
+    """
+    if not url:
+        return None
+    try:
+        return await _probe_reachable(url)
+    except Exception as e:  # A probe must never mask the original error.
+        log.debug("reachability probe for %s raised %s: %s", url, type(e).__name__, e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # The wrapper
 # ---------------------------------------------------------------------------
@@ -186,6 +272,7 @@ class MultiInstanceProxy(FastMCP):
         name: str,
         instances: dict[str, FastMCP],
         param_name: str = "instance",
+        instance_urls: dict[str, str] | None = None,
     ) -> None:
         if not instances:
             raise ValueError(
@@ -194,6 +281,10 @@ class MultiInstanceProxy(FastMCP):
         super().__init__(name)
         self._instances: dict[str, FastMCP] = dict(instances)
         self._param_name = param_name
+        # Per-instance upstream URL, for reachability diagnosis on failure.
+        # HTTP-ish backings only; stdio instances simply have no entry and
+        # fall back to the generic error.
+        self._instance_urls: dict[str, str] = dict(instance_urls or {})
         # Lazy cache of routing tools, populated on first list_tools() or
         # get_tool() call. Keyed by tool name. We populate atomically under
         # a lock to avoid double-init from concurrent requests.
@@ -259,6 +350,24 @@ class MultiInstanceProxy(FastMCP):
             for backing_tool in backing_tools:
                 routing_tool = self._make_routing_tool(backing_tool)
                 registry[routing_tool.name] = routing_tool
+            if not registry:
+                # Don't cache nothing. A backing that answers with zero
+                # tools is usually one that isn't ready yet -- a forwarded
+                # port whose far end is still coming up, say -- and caching
+                # that makes an empty tool surface permanent for the life
+                # of the process. (Chrome went missing for eleven hours
+                # this way on 2026-08-12: central rebooted ahead of the
+                # laptop's SSH RemoteForward, and no amount of refreshing
+                # helped because the gateway kept re-serving its cached
+                # empty registry.) Returning uncached costs one list_tools
+                # per access while genuinely empty, and self-heals the
+                # moment the backing has something to say.
+                log.warning(
+                    "MultiInstanceProxy %r: backing returned no tools; "
+                    "not caching, will retry on next access.",
+                    self.name,
+                )
+                return registry
             self._routing_tools = registry
             log.info(
                 "MultiInstanceProxy %r: built routing registry (%d tools, "
@@ -279,6 +388,8 @@ class MultiInstanceProxy(FastMCP):
         original_name = backing_tool.name
         param_name = self._param_name
         instances = self._instances
+        instance_urls = self._instance_urls
+        self_name = self.name
 
         async def handler(**kwargs: Any) -> Any:
             instance = kwargs.pop(param_name, None)
@@ -297,6 +408,26 @@ class MultiInstanceProxy(FastMCP):
             try:
                 return await backing.call_tool(original_name, kwargs)
             except Exception as e:
+                # Before blaming the call, ask whether the backing is even
+                # answering. FastMCP reports an unreachable upstream as
+                # NotFoundError ("Unknown tool"), which reads as a config
+                # error and sends readers into servers.json for an hour.
+                reason = await _diagnose_unreachable(instance_urls.get(instance))
+                if reason is not None:
+                    log.warning(
+                        "MultiInstanceProxy %r: %s=%r backing unreachable at "
+                        "%s (%s); original error was %s: %s",
+                        self_name, param_name, instance,
+                        instance_urls.get(instance), reason,
+                        type(e).__name__, e,
+                    )
+                    raise _backend_unreachable_error(
+                        original_name,
+                        param_name,
+                        instance,
+                        instance_urls[instance],
+                        reason,
+                    ) from e
                 others = [n for n in instances if n != instance]
                 raise _backend_failed_error(
                     original_name, param_name, instance, others, e

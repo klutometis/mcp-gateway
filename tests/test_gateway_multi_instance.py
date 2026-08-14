@@ -189,6 +189,59 @@ class TestLoadServersMultiInstance:
 # ---------------------------------------------------------------------------
 
 
+class TestStdioArgvExpansion:
+    """${VAR} in command/args, so a stdio server need not hardcode $HOME.
+
+    Without this, any host whose home differs (a corp box at
+    /usr/local/google/home/danenberg) must keep a private edit of the
+    committed servers.json -- a permanent merge conflict rather than a config.
+    """
+
+    def test_home_expands_in_args(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HOME", "/usr/local/google/home/danenberg")
+        cfg = {
+            "command": "uv",
+            "args": ["run", "--directory", "${HOME}/prg/gchat-mcp", "gchat-mcp"],
+        }
+        out = _proxy_config_for_stdio(cfg)
+        assert out["args"] == [
+            "run",
+            "--directory",
+            "/usr/local/google/home/danenberg/prg/gchat-mcp",
+            "gchat-mcp",
+        ]
+
+    def test_command_expands(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HOME", "/home/danenberg")
+        out = _proxy_config_for_stdio({"command": "${HOME}/bin/thing", "args": []})
+        assert out["command"] == "/home/danenberg/bin/thing"
+
+    def test_shell_forms_are_left_for_the_shell(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """bash -c entries do their own expansion; don't pre-empt them.
+
+        Bare $HOME and ${VAR:-default} must survive untouched, or the voice
+        server's carefully defaulted argv would be rewritten out from under it.
+        """
+        monkeypatch.setenv("HOME", "/home/danenberg")
+        monkeypatch.setenv("VOICE_INDEX", "")
+        argv = 'VOICE_INDEX="${VOICE_INDEX:-$HOME/etc/voice.pkl}" exec voice-mcp'
+        out = _proxy_config_for_stdio({"command": "bash", "args": ["-c", argv]})
+        assert out["args"] == ["-c", argv]
+
+    def test_unset_var_expands_empty_and_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("NOPE_NOT_SET", raising=False)
+        out = _proxy_config_for_stdio({"command": "x", "args": ["${NOPE_NOT_SET}/y"]})
+        assert out["args"] == ["/y"]
+
+    def test_non_string_args_survive(self) -> None:
+        out = _proxy_config_for_stdio({"command": "x", "args": ["a", 3, None]})
+        assert out["args"] == ["a", 3, None]
+
+
 class TestProxyConfigForStdio:
     def test_single_instance_uses_top_level_env_keys(
         self, monkeypatch: pytest.MonkeyPatch
@@ -201,6 +254,39 @@ class TestProxyConfigForStdio:
         }
         out = _proxy_config_for_stdio(cfg)
         assert out["env"] == {"FOO": "foo-val"}
+
+    def test_unset_env_key_is_skipped_not_forwarded_as_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """env_keys is forward-if-present.
+
+        Optional host overrides (VOICE_INDEX, VOICE_MODEL, ...) belong in
+        env_keys, but forwarding an unset one as None makes
+        StdioServerParameters fail pydantic validation and takes the whole
+        server down. Skip it and let the child use its own default.
+        """
+        monkeypatch.setenv("SET_KEY", "set-val")
+        monkeypatch.delenv("UNSET_KEY", raising=False)
+        cfg = {
+            "command": "uvx",
+            "args": [],
+            "env_keys": ["SET_KEY", "UNSET_KEY"],
+        }
+        out = _proxy_config_for_stdio(cfg)
+        assert out["env"] == {"SET_KEY": "set-val"}
+        assert None not in out["env"].values()
+
+    def test_unset_instance_env_map_source_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GMAIL_OAUTH_PATH_WORK", raising=False)
+        cfg = {"command": "npx", "args": [], "env_keys": []}
+        inst = {
+            "env_map": {"GMAIL_OAUTH_PATH": "GMAIL_OAUTH_PATH_WORK"},
+            "env_keys": ["ALSO_UNSET"],
+        }
+        out = _proxy_config_for_stdio(cfg, instance_overrides=inst)
+        assert out["env"] == {}
 
     def test_instance_env_map_renames_host_var(
         self, monkeypatch: pytest.MonkeyPatch
