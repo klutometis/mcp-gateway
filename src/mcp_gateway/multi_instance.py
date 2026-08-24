@@ -21,9 +21,12 @@ Key behaviors:
   the configured instances, so no synthetic discovery tool is needed
   in this configuration.
 - ``call_tool()``: pops the instance param from arguments, looks up
-  the corresponding backing proxy, delegates. Missing/unknown/failed
-  cases raise ToolError with the configured set in the message so the
-  model can self-correct in one round-trip.
+  the corresponding backing proxy, delegates. Missing and unknown
+  values raise ToolError naming the configured set, so the model can
+  self-correct in one round-trip. A call that names a real instance
+  and then fails inside it reports the underlying error alone — the
+  set is not the fix there, and saying it anyway reads as advice to
+  retry elsewhere.
 - Failed calls are triaged before they are reported: if the backing's
   URL refuses a TCP connection, the error says the backend is
   unreachable instead of parroting FastMCP's ``NotFoundError: Unknown
@@ -152,17 +155,37 @@ def _backend_failed_error(
     tool_name: str,
     param_name: str,
     instance: str,
-    others: Sequence[str],
     underlying: BaseException,
 ) -> ToolError:
-    others_msg = (
-        f"Other configured {param_name}s: {_list_str(others)}."
-        if others
-        else f"No other {param_name}s configured."
-    )
+    """The instance was named correctly and the backend failed on its own terms.
+
+    Silent about the other configured instances, for the same reason
+    ``_backend_unreachable_error`` below already is: the parameter was right,
+    so the set is not the fix. That sibling reached this conclusion first, for
+    the transport-down case; this is the general case catching up.
+
+    It used to append "Other configured {param_name}s: ..." to every backend
+    exception, whatever the cause. Two real examples, both on a correct
+    profile:
+
+        cdp error -32000: Not allowed.   Other configured profiles: work.
+        context deadline exceeded.       Other configured profiles: work.
+
+    One is Chrome refusing to capture a surface; the other is a timeout.
+    Neither has anything to do with profiles. But the sentence arrives exactly
+    where a remedy belongs and is the only actionable-looking noun in it, so it
+    reads as one — an agent took it for a suggestion and retried on ``work``,
+    where that tab id did not exist, turning one clear failure into two
+    confusing ones. A human reader called it a tic.
+
+    The set is already on the model's side of the wire three times over: in the
+    tool description, in the injected param's ``description``, and in its
+    ``enum`` (see ``inject_instance_param``). A fourth copy, appended to
+    unrelated failures, only competes with the real error.
+    """
     return ToolError(
         f"Call to {tool_name!r} on {param_name}={instance!r} failed: "
-        f"{type(underlying).__name__}: {underlying}. {others_msg}"
+        f"{type(underlying).__name__}: {underlying}"
     )
 
 
@@ -428,9 +451,8 @@ class MultiInstanceProxy(FastMCP):
                         instance_urls[instance],
                         reason,
                     ) from e
-                others = [n for n in instances if n != instance]
                 raise _backend_failed_error(
-                    original_name, param_name, instance, others, e
+                    original_name, param_name, instance, e
                 ) from e
 
         return FunctionTool(

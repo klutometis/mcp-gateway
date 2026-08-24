@@ -215,7 +215,16 @@ class TestMultiInstanceProxy:
         assert "'prod'" in msg
         assert "personal" in msg and "work" in msg
 
-    async def test_backend_failure_enriches_with_others(self) -> None:
+    async def test_backend_failure_reports_only_the_failure(self) -> None:
+        # Inverted deliberately. This used to assert the opposite ("must list
+        # other configured instances"), and the enumeration turned out to read
+        # as a suggested remedy on failures that had nothing to do with the
+        # instance -- a CDP "Not allowed", a timeout. An agent followed the
+        # hint to the other profile, where the resource did not exist.
+        #
+        # _backend_unreachable_error already declined to name others for the
+        # transport-down case; this is the general case agreeing with it. The
+        # set still appears on missing/unknown, where it is the fix.
         wrapper = MultiInstanceProxy(
             "gmail",
             instances={
@@ -230,11 +239,11 @@ class TestMultiInstanceProxy:
             )
         msg = str(excinfo.value)
         assert "personal" in msg, "must say which instance failed"
-        assert "work" in msg, "must list other configured instances"
         # FastMCP wraps the RuntimeError in its own ToolError before our
         # handler sees it; what matters for the model is that the
         # underlying message ("backing personal is broken") propagates.
         assert "broken" in msg, "must carry the underlying error message"
+        assert "work" not in msg, "must not offer the other instance as a fix"
 
     async def test_param_name_is_configurable(self) -> None:
         wrapper = MultiInstanceProxy(
