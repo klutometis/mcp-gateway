@@ -32,23 +32,53 @@ free.
 | stub advertisement | 994 |
 | **saving** | **3,471 (78%)** |
 
-## Why not harness's mechanism
+## Relation to harness's catalog — the same idea, serialized differently
 
-harness (`packages/daemon/src/mcp/catalog.ts`) solves the same problem by
-omitting cold tools from the tool array entirely and listing them in the
-**system prompt** as `name: first sentence`. That is cheaper still — 1.7k for
-64 tools — and a direct call to an omitted tool is caught, promoted, and
-re-run invisibly (`mcp/repair.ts`).
+harness (`packages/daemon/src/mcp/catalog.ts`) omits cold tools from the tool
+array and lists them in its **system prompt** as `name: first sentence`. A
+direct call to an omitted tool raises `NoSuchToolError` client-side, which
+`mcp/repair.ts` catches, promotes, and re-runs with the model's original
+arguments.
 
-The gateway cannot do that. It is an MCP server, outside the agent loop, with
-no channel into the consumer's system prompt. And a tool that is *absent* from
-the list gets rejected by the **client**, so the call never arrives and there
-is nothing to repair.
+It is tempting to call that "invisible repair" and treat it as a category
+apart. It is not. Both designs advertise a name and a sentence, ask the model
+to infer the arguments, and correct it once if it infers wrong:
 
-Stubs were explicitly measured and rejected *for harness* at +1,291 tokens per
-turn against the catalog. That verdict does not transfer: harness's baseline
-is a prose catalog it can inject, the gateway's baseline is full schemas.
-Same mechanism, opposite conclusion, because the alternative differs.
+| | harness | gateway stub |
+|---|---|---|
+| what the model sees up front | name + first sentence | name + first sentence |
+| asked to load a schema first | no | no |
+| args inferred from name, sentence, context | yes | yes |
+| **inference right** | runs, 0 extra samples | runs, 0 extra samples |
+| **inference wrong** | `InvalidToolInputError`, 1 correction | signature error, 1 correction |
+
+Measured over the same 30 device-backed tools, the difference is the envelope
+and nothing else:
+
+| advertisement | tokens/tool |
+|---|---|
+| harness catalog line (prose, system prompt) | 17.9 |
+| gateway stub (JSON, tool array) | 33.1 |
+| full schema | 148.9 |
+
+Prose is cheaper than JSON because a tool-array entry has to carry `{"name":
+…, "description": …, "inputSchema": {…}}` per tool. That is the whole of the
++1,291-tokens-per-turn measurement that rejected stubs *for harness*: 89 tools
+× the envelope. It is a serialization result, not evidence that one mechanism
+repairs and the other does not.
+
+The genuine asymmetry is narrow: **harness's repair exists to undo a problem
+harness creates.** Omitting a tool from the array manufactures a
+`NoSuchToolError` that has to be caught and replayed. The gateway's stub never
+manufactures it — the tool is present, the empty schema accepts anything
+client-side, and the call simply arrives. Fewer moving parts, no repair hook,
+same outcome. If anything the stub design is the cleaner of the two; it just
+costs 15 tokens a tool more to advertise.
+
+The reason the gateway cannot adopt harness's cheaper form is positional, not
+conceptual: it is an MCP server outside the agent loop, with no channel into
+the consumer's system prompt, and a tool absent from the list is rejected by
+the **client** before any call reaches it.
 
 ## Why intercept rather than let the upstream complain
 
@@ -104,16 +134,24 @@ Keyed on the consumer, which the gateway already distinguishes by bearer
 token. `full` restores exactly what ships today, so a bad rollout is a config
 change rather than a revert.
 
-**harness must stay on `full`.** It withholds schemas itself and promotes a
-tool on first call; if the gateway then served it a stub, the promotion would
-yield no schema and harness would pay a *second* round trip it does not pay
-today. The two mechanisms compose only if the gateway is honest with harness.
+**harness should stay on `full`,** for a plainer reason than "harness is
+special". Its catalog already advertises cold tools at 17.9 tokens each, so a
+gateway stub adds nothing it does not have. What the stub *removes* is the
+real schema that promotion exists to reveal: promote a tool whose schema is
+`{"type":"object"}` and the model is no better informed than before, and every
+shape has to be learned from an error that now costs a network hop instead of
+an in-process validation.
 
-That is also the answer to "can we eventually ship this to harness too": not
-this half. harness already has the better version for its situation — a prose
-catalog plus invisible repair — and stubs would be a regression there. The
-transfer runs the other way. What the gateway should take from harness is what
-harness measured:
+So it is not a catastrophe, just pointless — harness would pay the JSON
+envelope for advertisements it already has cheaper, and lose local validation
+in exchange. Serve it the schemas; it withholds them itself.
+
+That is also the honest answer to "can we ship this to harness too": there is
+nothing to ship. It is the same mechanism, and harness is already running the
+cheaper serialization of it.
+
+The transfer that *is* worth making runs the other way, and one leg of it runs
+back again:
 
 - **No ask-first tool.** `request_tool` was deleted on 2026-08-16 after an A/B
   showed the model calls the tool it wants regardless (compliance 0/12 vs
@@ -123,6 +161,16 @@ harness measured:
   everything above.
 - **The error is the affordance.** Return `name(arg, arg, optional: arg)`, the
   shape harness's `signatureOf` used, not a validator dump.
+
+And the leg running back: **harness should return a signature on a wrong-guess
+too.** Today a cold tool called with bad arguments produces
+`AI_InvalidToolInputError` with the SDK's zod dump — correct, and much less
+useful than the one line naming the shape. harness already has `signatureOf`;
+it was written for the predecessor of `repair.ts` and is now unused. The
+model's inference failed for want of a schema, and a validator dump is a poor
+substitute for the signature it was missing. Cheap fix, same idea as step 3
+below, and it makes the two implementations behave identically on the only
+path where they visibly differ.
 
 ## Work
 
