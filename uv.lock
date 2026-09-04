@@ -636,6 +636,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
+    { name = "jsonschema" },
     { name = "pillow" },
     { name = "py-key-value-aio", extra = ["disk"] },
     { name = "pyjwt" },
@@ -652,6 +653,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = ">=3.4.4" },
+    { name = "jsonschema", specifier = ">=4.20" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "py-key-value-aio", extras = ["disk"], specifier = ">=0.4.4" },
     { name = "pyjwt", specifier = ">=2.10.1" },

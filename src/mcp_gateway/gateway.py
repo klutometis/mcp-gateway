@@ -538,11 +538,18 @@ def create_gateway(
     # on the way out. Generic over the MCP `image` type; no per-server config.
     # Tuned via MCP_IMAGE_* env. See src/mcp_gateway/middleware/image_downscale.py
     # and plans/visual-context-management.md.
-    from mcp_gateway.middleware import ImageDownscaleMiddleware
+    from mcp_gateway.middleware import ImageDownscaleMiddleware, StubSchemaMiddleware
 
     _img_mw = ImageDownscaleMiddleware.from_env()
     if _img_mw is not None:
         gateway.add_middleware(_img_mw)
+
+    # Advertise tools without their argument schemas, and answer a wrong guess
+    # with the tool's signature. 75% of a tools/list payload is schemas nobody
+    # asked for. Off unless MCP_SCHEMA_MODE=stub; see notes/stub-schemas.md.
+    _stub_mw = StubSchemaMiddleware.from_env()
+    if _stub_mw is not None:
+        gateway.add_middleware(_stub_mw)
 
     # Track proxies needing warm-up on startup. FastMCP's stdio transport is
     # lazy: subprocesses don't spawn until first tool call. For wss-shim-backed
