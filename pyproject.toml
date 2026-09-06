@@ -5,7 +5,17 @@ description = "Generic MCP gateway: config-driven aggregation of multiple MCP se
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp>=3.4.4",
+    # Upper-bounded, not just floored. fastmcp 4.0 moved the module layout
+    # this code imports from — `fastmcp.tools.tool` is gone, ToolResult lives
+    # at `fastmcp.tools` — and six imports here still use the 3.x paths. An
+    # unbounded `>=3.4.4` resolved to 4.0.3 in a clean container build on
+    # 2026-09-06 and the gateway died at import with ModuleNotFoundError,
+    # after the image built and the healthcheck passed. Local dev never saw
+    # it: uv.lock held 3.4.4.
+    #
+    # Lift the ceiling deliberately, with the import paths updated in the same
+    # commit.
+    "fastmcp>=3.4.4,<4",
     "jsonschema>=4.20",
     "pillow>=12.2.0",
     "py-key-value-aio[disk]>=0.4.4",
