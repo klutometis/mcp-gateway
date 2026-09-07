@@ -60,7 +60,7 @@ from urllib.parse import urlsplit
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.function_tool import FunctionTool
-from fastmcp.tools.tool import Tool, ToolResult
+from fastmcp.tools import Tool, ToolResult
 
 log = logging.getLogger(__name__)
 

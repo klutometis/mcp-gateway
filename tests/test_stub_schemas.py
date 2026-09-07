@@ -41,7 +41,7 @@ class TestAdvertisement:
             tools = {t.name: t for t in await c.list_tools()}
 
         # The whole point: no properties, no required, nothing to read.
-        assert tools["send_keys"].inputSchema == {"type": "object"}
+        assert tools["send_keys"].input_schema == {"type": "object"}
 
     async def test_description_is_trimmed_to_its_first_sentence(self) -> None:
         async with Client(build()) as c:
@@ -55,7 +55,7 @@ class TestAdvertisement:
 
         assert "prefer a tool" in tools["send_keys"].description
         # Schemas are still stubbed; the two settings are independent.
-        assert tools["send_keys"].inputSchema == {"type": "object"}
+        assert tools["send_keys"].input_schema == {"type": "object"}
 
     async def test_always_full_keeps_its_real_schema(self) -> None:
         # For tools where a schema-valid guess is expensive, ~100 tokens to
@@ -63,8 +63,8 @@ class TestAdvertisement:
         async with Client(build(always_full=frozenset({"send_keys"}))) as c:
             tools = {t.name: t for t in await c.list_tools()}
 
-        assert "session" in tools["send_keys"].inputSchema["properties"]
-        assert tools["ping"].inputSchema.get("properties") in (None, {})
+        assert "session" in tools["send_keys"].input_schema["properties"]
+        assert tools["ping"].input_schema.get("properties") in (None, {})
 
 
 class TestCorrectCallsAreUntouched:
@@ -87,24 +87,38 @@ class TestCorrectCallsAreUntouched:
         assert r.content[0].text == "pong"
 
 
+async def call_raw(server: FastMCP, name: str, args: dict) -> str:
+    """Call as a stub consumer does, and return the error text.
+
+    ``Client.call_tool`` validates arguments locally against the tool's real
+    schema before sending — which a stub consumer cannot do, because the schema
+    it was given is ``{"type": "object"}``. Going through the client would test
+    fastmcp's client-side validation instead of this middleware, and on 4.x
+    that is exactly what happened: three tests started asserting against
+    pydantic's "1 validation error for call[send_keys]" rather than the
+    signature the server actually returns.
+
+    So: dispatch through the server the way the wire does.
+    """
+    async with Client(server) as c:
+        await c.list_tools()  # populate the middleware's schema cache
+        result = await c.session.call_tool(name, args)
+    assert result.is_error, "expected the call to be rejected"
+    return "".join(getattr(b, "text", "") for b in result.content)
+
+
 class TestWrongGuessesGetTheSignature:
     async def test_missing_required_argument(self) -> None:
-        async with Client(build()) as c:
-            with pytest.raises(Exception) as excinfo:
-                await c.call_tool("send_keys", {"session": "s"})
+        msg = await call_raw(build(), "send_keys", {"session": "s"})
 
-        msg = str(excinfo.value)
         assert "keys" in msg
         assert "send_keys(session, keys, optional: enter)" in msg
 
     async def test_wrong_argument_name(self) -> None:
         # The upstream would have said only "keys is required", never that
         # `target` was the mistake. Both halves matter to the retry.
-        async with Client(build()) as c:
-            with pytest.raises(Exception) as excinfo:
-                await c.call_tool("send_keys", {"target": "s", "keys": "ls"})
+        msg = await call_raw(build(), "send_keys", {"target": "s", "keys": "ls"})
 
-        msg = str(excinfo.value)
         assert "target" in msg
         assert "send_keys(session, keys, optional: enter)" in msg
 
@@ -112,22 +126,17 @@ class TestWrongGuessesGetTheSignature:
         # The case that motivated validating at the gateway at all: a real
         # upstream given an extra key ignored it and ran the call, so a model
         # that half-guessed got a success and no correction.
-        async with Client(build()) as c:
-            with pytest.raises(Exception) as excinfo:
-                await c.call_tool(
-                    "send_keys", {"session": "s", "keys": "ls", "bogus": 1}
-                )
+        msg = await call_raw(
+            build(), "send_keys", {"session": "s", "keys": "ls", "bogus": 1}
+        )
 
-        assert "bogus" in str(excinfo.value)
+        assert "bogus" in msg
 
     async def test_wrong_type(self) -> None:
-        async with Client(build()) as c:
-            with pytest.raises(Exception) as excinfo:
-                await c.call_tool(
-                    "send_keys", {"session": "s", "keys": "ls", "enter": "yes"}
-                )
+        msg = await call_raw(
+            build(), "send_keys", {"session": "s", "keys": "ls", "enter": "yes"}
+        )
 
-        msg = str(excinfo.value)
         assert "enter" in msg
         assert "signature" in msg.lower()
 

@@ -68,7 +68,7 @@ from typing import Any, Sequence
 import mcp.types as mt
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
-from fastmcp.tools.tool import Tool
+from fastmcp.tools import Tool
 from jsonschema import Draft7Validator
 
 log = logging.getLogger(__name__)

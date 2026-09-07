@@ -5,17 +5,16 @@ description = "Generic MCP gateway: config-driven aggregation of multiple MCP se
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    # Upper-bounded, not just floored. fastmcp 4.0 moved the module layout
-    # this code imports from — `fastmcp.tools.tool` is gone, ToolResult lives
-    # at `fastmcp.tools` — and six imports here still use the 3.x paths. An
-    # unbounded `>=3.4.4` resolved to 4.0.3 in a clean container build on
-    # 2026-09-06 and the gateway died at import with ModuleNotFoundError,
-    # after the image built and the healthcheck passed. Local dev never saw
-    # it: uv.lock held 3.4.4.
-    #
-    # Lift the ceiling deliberately, with the import paths updated in the same
-    # commit.
-    "fastmcp>=3.4.4,<4",
+    # 4.x. The 2026-09-06 break was one module: `fastmcp.tools.tool` became
+    # `fastmcp.tools`, and three imports here used the old path. The public
+    # `fastmcp.tools` path works on 3.4.4 too, so the floor stays where it is
+    # and there is no ceiling to outgrow.
+    "fastmcp>=3.4.4",
+    # Imported directly (gateway.py: authlib for the OAuth proxy, which needs
+    # httpx). Both rode in transitively under fastmcp 3.x and vanished on 4.x,
+    # so they were never really optional — just undeclared.
+    "authlib>=1.3",
+    "httpx>=0.27",
     "jsonschema>=4.20",
     "pillow>=12.2.0",
     "py-key-value-aio[disk]>=0.4.4",
