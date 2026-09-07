@@ -329,7 +329,24 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    app = gateway.http_app(middleware=middlewares)
+    # Stateless, matching local.py -- which reached this conclusion first and
+    # explains it: no Mcp-Session-Id to go stale, so a deploy no longer strands
+    # connected clients with "Session not found", and our tools are pure
+    # request/response, so sessions buy us nothing.
+    #
+    # They also cost something, measured 2026-09-07. In stateful mode the
+    # server accepts the client's standalone GET stream -- the one Streamable
+    # HTTP defines for server-initiated messages -- and holds it open. With
+    # that stream held, every subsequent POST on the session stopped
+    # delivering a body: headers in 320ms, then nothing. The Inspector CLI
+    # opens that GET on connect, so every CLI invocation against this host
+    # died at the SDK's 60s request timeout while curl, which opens no GET,
+    # answered in 300ms.
+    #
+    # The same experiment against local returns 405 to the GET -- stateless
+    # has no stream to hold -- and the POST completes in 1.2s. That is the
+    # whole difference; the two entrypoints had simply drifted.
+    app = gateway.http_app(middleware=middlewares, stateless_http=True)
 
     # Pre-warm stdio children at boot. FastMCP's stdio transport is lazy:
     # subprocesses don't spawn until the first tool call, so that first
