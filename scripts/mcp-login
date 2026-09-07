@@ -191,10 +191,11 @@ def authenticate(server: str, *, open_browser: bool = True) -> str:
 class Session:
     """A live MCP session: initialize once, then call."""
 
-    def __init__(self, server: str, token: str) -> None:
+    def __init__(self, server: str, token: str, on_unauthorized=None) -> None:
         self.url = f"{server}/mcp"
         self.token = token
         self.sid: str | None = None
+        self.on_unauthorized = on_unauthorized
         self.client = httpx.Client(timeout=120)
 
     def _headers(self) -> dict[str, str]:
@@ -212,6 +213,16 @@ class Session:
         if not notify:
             msg["id"] = 1
         r = self.client.post(self.url, json=msg, headers=self._headers())
+        if r.status_code == 401 and self.on_unauthorized is not None:
+            # A cached token can be rejected before it expires: every deploy
+            # rotates the gateway's JWT signing key, so yesterday's token is
+            # unverifiable today. Indistinguishable from expiry at the client,
+            # and telling the user to run --logout is just making them do what
+            # we can do here.
+            print("token rejected (server key rotated?); re-authenticating", file=sys.stderr)
+            self.token = self.on_unauthorized()
+            self.sid = None
+            r = self.client.post(self.url, json=msg, headers=self._headers())
         if r.status_code == 401:
             sys.exit("401 — token rejected. Try --logout and re-run.")
         r.raise_for_status()
@@ -259,9 +270,13 @@ def main() -> None:
         print(f"forgot {p}")
         return
 
+    def reauth() -> str:
+        cache_path(server).unlink(missing_ok=True)
+        return authenticate(server, open_browser=not args.no_browser)
+
     token = cached_token(server) or authenticate(server, open_browser=not args.no_browser)
 
-    s = Session(server, token)
+    s = Session(server, token, on_unauthorized=reauth)
     init = s.open()
     info = init.get("result", {}).get("serverInfo", {})
     print(f"# {info.get('name','?')} {info.get('version','')} @ {server}", file=sys.stderr)
