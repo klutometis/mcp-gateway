@@ -531,10 +531,21 @@ def _issuer_slash_middlewares():
         def __init__(self, app):
             self.app = app
 
+        # Every path that can emit a client redirect carrying `iss`.
+        #
+        # NOT just /authorize -- that was the first version of this fix, and it
+        # never fired. FastMCP's OAuthProxy emits the client redirect from
+        # `_handle_idp_callback`, registered at `self._redirect_path`, which
+        # defaults to "/auth/callback" (proxy.py:491). /authorize only
+        # redirects inward, to /consent, with no iss on it. /consent is here
+        # because approving there also lands in the same callback machinery,
+        # and a future FastMCP could shortcut straight to the client.
+        PATHS = ("/auth/callback", "/authorize", "/consent")
+
         async def __call__(self, scope, receive, send):
             if not (
                 scope["type"] == "http"
-                and scope.get("path", "").startswith("/authorize")
+                and scope.get("path", "").startswith(self.PATHS)
             ):
                 await self.app(scope, receive, send)
                 return

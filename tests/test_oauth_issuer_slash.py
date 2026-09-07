@@ -129,6 +129,30 @@ class TestAuthorizeRedirect:
         )
         assert headers[b"location"].decode() == loc
 
+    @pytest.mark.parametrize("path", ["/auth/callback", "/authorize", "/consent"])
+    async def test_covers_every_path_that_redirects_to_the_client(
+        self, path: str
+    ) -> None:
+        # The first version of this fix only matched /authorize and therefore
+        # never fired: FastMCP emits the client redirect from
+        # _handle_idp_callback, registered at _redirect_path, which defaults
+        # to /auth/callback (proxy.py:491). /authorize only redirects inward
+        # to /consent. Claude's connector still failed after that deploy,
+        # which is how the miss surfaced.
+        loc = (
+            "http://127.0.0.1:9876/callback?code=abc"
+            "&iss=https%3A%2F%2Fmcp.danenberg.ai%2F"
+        )
+        _, headers, _ = await drive(
+            AuthorizeIss,
+            path=path,
+            status=302,
+            headers=[(b"location", loc.encode())],
+        )
+        assert "mcp.danenberg.ai%2F" not in headers[b"location"].decode(), (
+            f"{path} must be normalized"
+        )
+
     async def test_a_redirect_with_no_iss_is_untouched(self) -> None:
         loc = "http://127.0.0.1:9876/callback?code=abc&state=xyz"
         _, headers, _ = await drive(
