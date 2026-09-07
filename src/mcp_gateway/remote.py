@@ -267,102 +267,9 @@ def main() -> None:
 
     middlewares.append(Middleware(WwwAuthenticateRewriteMiddleware))
 
-    # ------------------------------------------------------------------
-    # OAuth well-known issuer trailing-slash normalizer
-    # ------------------------------------------------------------------
-    # The low-level `mcp` python-sdk builds OAuth metadata URLs from
-    # pydantic `AnyHttpUrl`, and `str(AnyHttpUrl("https://host"))` yields
-    # "https://host/" -- a lone trailing slash. Per RFC 8414 the issuer
-    # identifier for an authorization server with no path component must be
-    # exactly the origin (no trailing slash), and strict clients verify the
-    # discovered metadata `issuer` is byte-identical to the origin they
-    # derived. The trailing slash makes that check fail, aborting discovery.
-    #
-    # This is upstream bug modelcontextprotocol/python-sdk#1919 (P1, still
-    # unmerged as of 2026-07), so no FastMCP/mcp version bump fixes it yet.
-    # Newer strict clients (e.g. @ai-sdk/mcp v2, Google ADK, IBM Context
-    # Forge) refuse to connect; lenient older clients happened not to care.
-    #
-    # We rewrite the two public well-known documents on the way out,
-    # stripping the lone trailing slash from origin-only URLs in the
-    # `issuer`, `resource`, and `authorization_servers` fields. Endpoint
-    # URLs (which carry a real path) are left untouched.
-    class WellKnownIssuerNormalizeMiddleware:
-        def __init__(self, app):
-            self.app = app
-
-        @staticmethod
-        def _strip(url):
-            # Only strip a lone trailing slash on an origin-only URL
-            # (path == "/", no query/fragment); leave path URLs intact.
-            if not isinstance(url, str) or not url.endswith("/"):
-                return url
-            try:
-                from urllib.parse import urlsplit
-
-                parts = urlsplit(url)
-                if parts.path == "/" and not parts.query and not parts.fragment:
-                    return url[:-1]
-            except Exception:
-                pass
-            return url
-
-        def _normalize(self, data):
-            if not isinstance(data, dict):
-                return data
-            for key in ("issuer", "resource"):
-                if key in data:
-                    data[key] = self._strip(data[key])
-            servers = data.get("authorization_servers")
-            if isinstance(servers, list):
-                data["authorization_servers"] = [self._strip(s) for s in servers]
-            return data
-
-        async def __call__(self, scope, receive, send):
-            path = scope.get("path", "") if scope["type"] == "http" else ""
-            if not path.startswith("/.well-known/oauth-"):
-                await self.app(scope, receive, send)
-                return
-
-            start_message = {}
-            body_chunks: list[bytes] = []
-
-            async def capture_send(message):
-                if message["type"] == "http.response.start":
-                    start_message.clear()
-                    start_message.update(message)
-                    return
-                if message["type"] == "http.response.body":
-                    body_chunks.append(message.get("body", b""))
-                    if message.get("more_body", False):
-                        return
-                    # Final chunk: rewrite the buffered JSON body.
-                    body = b"".join(body_chunks)
-                    new_body = body
-                    try:
-                        data = json.loads(body.decode("utf-8"))
-                        data = self._normalize(data)
-                        new_body = json.dumps(data).encode("utf-8")
-                    except Exception:
-                        new_body = body
-                    headers = [
-                        (n, v)
-                        for n, v in start_message.get("headers", [])
-                        if n.lower() != b"content-length"
-                    ]
-                    headers.append(
-                        (b"content-length", str(len(new_body)).encode("latin-1"))
-                    )
-                    await send({**start_message, "headers": headers})
-                    await send(
-                        {"type": "http.response.body", "body": new_body}
-                    )
-                    return
-                await send(message)
-
-            await self.app(scope, receive, capture_send)
-
-    middlewares.append(Middleware(WellKnownIssuerNormalizeMiddleware))
+    wk_mw, authorize_mw = _issuer_slash_middlewares()
+    middlewares.append(Middleware(wk_mw))
+    middlewares.append(Middleware(authorize_mw))
 
     if allowed_users:
 
@@ -487,6 +394,208 @@ def main() -> None:
     print(f"Listening on 0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
 
+
+
+def _issuer_slash_middlewares():
+    """The two middlewares that undo AnyHttpUrl's trailing slash.
+
+    Module scope, and returned rather than defined inline, so tests can
+    drive them without building a gateway (which needs live OAuth
+    credentials). Both are pure ASGI and hold no configuration.
+    """
+    # ------------------------------------------------------------------
+    # OAuth well-known issuer trailing-slash normalizer
+    # ------------------------------------------------------------------
+    # The low-level `mcp` python-sdk builds OAuth metadata URLs from
+    # pydantic `AnyHttpUrl`, and `str(AnyHttpUrl("https://host"))` yields
+    # "https://host/" -- a lone trailing slash. Per RFC 8414 the issuer
+    # identifier for an authorization server with no path component must be
+    # exactly the origin (no trailing slash), and strict clients verify the
+    # discovered metadata `issuer` is byte-identical to the origin they
+    # derived. The trailing slash makes that check fail, aborting discovery.
+    #
+    # This is upstream bug modelcontextprotocol/python-sdk#1919 (P1, still
+    # unmerged as of 2026-07), so no FastMCP/mcp version bump fixes it yet.
+    # Newer strict clients (e.g. @ai-sdk/mcp v2, Google ADK, IBM Context
+    # Forge) refuse to connect; lenient older clients happened not to care.
+    #
+    # We rewrite the two public well-known documents on the way out,
+    # stripping the lone trailing slash from origin-only URLs in the
+    # `issuer`, `resource`, and `authorization_servers` fields. Endpoint
+    # URLs (which carry a real path) are left untouched.
+    class WellKnownIssuerNormalizeMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        @staticmethod
+        def _strip(url):
+            # Only strip a lone trailing slash on an origin-only URL
+            # (path == "/", no query/fragment); leave path URLs intact.
+            if not isinstance(url, str) or not url.endswith("/"):
+                return url
+            try:
+                from urllib.parse import urlsplit
+
+                parts = urlsplit(url)
+                if parts.path == "/" and not parts.query and not parts.fragment:
+                    return url[:-1]
+            except Exception:
+                pass
+            return url
+
+        def _normalize(self, data):
+            if not isinstance(data, dict):
+                return data
+            for key in ("issuer", "resource"):
+                if key in data:
+                    data[key] = self._strip(data[key])
+            servers = data.get("authorization_servers")
+            if isinstance(servers, list):
+                data["authorization_servers"] = [self._strip(s) for s in servers]
+            return data
+
+        async def __call__(self, scope, receive, send):
+            path = scope.get("path", "") if scope["type"] == "http" else ""
+            if not path.startswith("/.well-known/oauth-"):
+                await self.app(scope, receive, send)
+                return
+
+            start_message = {}
+            body_chunks: list[bytes] = []
+
+            async def capture_send(message):
+                if message["type"] == "http.response.start":
+                    start_message.clear()
+                    start_message.update(message)
+                    return
+                if message["type"] == "http.response.body":
+                    body_chunks.append(message.get("body", b""))
+                    if message.get("more_body", False):
+                        return
+                    # Final chunk: rewrite the buffered JSON body.
+                    body = b"".join(body_chunks)
+                    new_body = body
+                    try:
+                        data = json.loads(body.decode("utf-8"))
+                        data = self._normalize(data)
+                        new_body = json.dumps(data).encode("utf-8")
+                    except Exception:
+                        new_body = body
+                    headers = [
+                        (n, v)
+                        for n, v in start_message.get("headers", [])
+                        if n.lower() != b"content-length"
+                    ]
+                    headers.append(
+                        (b"content-length", str(len(new_body)).encode("latin-1"))
+                    )
+                    await send({**start_message, "headers": headers})
+                    await send(
+                        {"type": "http.response.body", "body": new_body}
+                    )
+                    return
+                await send(message)
+
+            await self.app(scope, receive, capture_send)
+
+
+    # ------------------------------------------------------------------
+    # RFC 9207 authorize-response `iss` trailing-slash normalizer
+    # ------------------------------------------------------------------
+    # Same root cause as the well-known normalizer above -- `AnyHttpUrl`
+    # stringifying a bare origin as "https://host/" -- surfacing on a
+    # different code path, so the body rewrite above never sees it.
+    #
+    # RFC 9207 has the authorization server echo its issuer as an `iss`
+    # query parameter on the redirect back to the client. FastMCP builds
+    # that from the same pydantic URL, so it carries the slash, while the
+    # metadata this gateway serves does not (thanks to the middleware
+    # above). The client then compares the two with *simple string
+    # comparison* -- RFC 9207 s2.4 explicitly forbids normalizing first --
+    # and aborts:
+    #
+    #     Issuer mismatch in authorization response (RFC 9207):
+    #     expected "https://mcp.danenberg.ai", received "https://mcp.danenberg.ai/"
+    #
+    # Observed in Claude's connector, which loops on re-authentication, and
+    # in the python-sdk client (mcp/client/auth/utils.py,
+    # validate_authorization_response_iss). Clients that skip the check --
+    # @ai-sdk/mcp v2, and therefore llm.danenberg.ai -- are unaffected,
+    # which is why this survived unnoticed after the July fix.
+    #
+    # Rewrite the Location header on the way out. Only `iss`, only a lone
+    # trailing slash on an origin-only URL, and only on redirects: the
+    # authorization code and state ride in the same query string and must
+    # pass through untouched.
+    class AuthorizeIssNormalizeMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if not (
+                scope["type"] == "http"
+                and scope.get("path", "").startswith("/authorize")
+            ):
+                await self.app(scope, receive, send)
+                return
+
+            async def rewrite_send(message):
+                if (
+                    message["type"] == "http.response.start"
+                    and 300 <= message.get("status", 0) < 400
+                ):
+                    from urllib.parse import (
+                        parse_qsl,
+                        urlencode,
+                        urlsplit,
+                        urlunsplit,
+                    )
+
+                    new_headers = []
+                    for name, value in message.get("headers", []):
+                        if name.lower() != b"location":
+                            new_headers.append((name, value))
+                            continue
+                        try:
+                            loc = value.decode("latin-1")
+                            parts = urlsplit(loc)
+                            # keep_blank_values: dropping an empty parameter
+                            # the client sent would be its own small bug.
+                            q = parse_qsl(parts.query, keep_blank_values=True)
+                            changed = False
+                            out = []
+                            for k, v in q:
+                                if k == "iss":
+                                    stripped = (
+                                        WellKnownIssuerNormalizeMiddleware._strip(v)
+                                    )
+                                    if stripped != v:
+                                        changed = True
+                                        v = stripped
+                                out.append((k, v))
+                            if changed:
+                                loc = urlunsplit(
+                                    (
+                                        parts.scheme,
+                                        parts.netloc,
+                                        parts.path,
+                                        urlencode(out),
+                                        parts.fragment,
+                                    )
+                                )
+                                value = loc.encode("latin-1")
+                        except Exception:
+                            # A Location we cannot parse is a Location we
+                            # pass through: breaking the redirect is worse
+                            # than leaving the slash on.
+                            pass
+                        new_headers.append((name, value))
+                    message = {**message, "headers": new_headers}
+                await send(message)
+
+            await self.app(scope, receive, rewrite_send)
+
+    return WellKnownIssuerNormalizeMiddleware, AuthorizeIssNormalizeMiddleware
 
 if __name__ == "__main__":
     main()
