@@ -1,0 +1,300 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["httpx>=0.27"]
+# ///
+"""Get a bearer token for an OAuth-gated MCP server, and call it.
+
+The gateway is behind Google OIDC, so `curl https://mcp.danenberg.ai/mcp`
+returns 401 and there is no static token to fall back on. MCP Inspector can do
+the dance but is a GUI, and its CLI mode does not implement the flow.
+
+This does the whole thing headlessly except the one step that genuinely needs a
+human: clicking "Allow" in a browser. Registration is RFC 7591 dynamic, so no
+client has to be pre-provisioned.
+
+    mcp-login                       # authenticate, cache the token, list tools
+    mcp-login --tools               # just the tool names
+    mcp-login --call NAME --args '{"k":"v"}'
+    mcp-login --raw tools/list      # any JSON-RPC method
+    mcp-login --logout              # forget the cached token
+
+The token is cached in $XDG_STATE_HOME/mcp-login/<host>.json (0600) and reused
+until it expires, so the browser step happens once an hour, not once a call.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import secrets
+import sys
+import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import httpx
+
+CALLBACK_PORT = 9876
+REDIRECT_URI = f"http://127.0.0.1:{CALLBACK_PORT}/callback"
+
+
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    d = Path(base) / "mcp-login"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def cache_path(server: str) -> Path:
+    return state_dir() / (urlparse(server).netloc.replace(":", "_") + ".json")
+
+
+def cached_token(server: str) -> str | None:
+    p = cache_path(server)
+    if not p.exists():
+        return None
+    try:
+        blob = json.loads(p.read_text())
+    except json.JSONDecodeError:
+        return None
+    # 60s of slack: a token that expires mid-request is a confusing 401.
+    if blob.get("expires_at", 0) < time.time() + 60:
+        return None
+    return blob.get("access_token")
+
+
+def save_token(server: str, tok: dict) -> None:
+    p = cache_path(server)
+    p.write_text(
+        json.dumps(
+            {
+                "access_token": tok["access_token"],
+                "expires_at": time.time() + tok.get("expires_in", 3600),
+                "refresh_token": tok.get("refresh_token"),
+            }
+        )
+    )
+    p.chmod(0o600)
+
+
+class _Catcher(BaseHTTPRequestHandler):
+    result: dict = {}
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+
+        # Only the real callback counts. A browser also asks for /favicon.ico
+        # right after following the redirect, and treating that as the result
+        # overwrites the captured code with {} — which surfaces later as a
+        # bogus "state mismatch", because the state is simply gone.
+        if "code" not in params and "error" not in params:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        _Catcher.result = params
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<h3>Authenticated. You can close this tab.</h3>")
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    def log_message(self, *a: object) -> None:
+        pass
+
+
+def authenticate(server: str, *, open_browser: bool = True) -> str:
+    """Full authorization-code + PKCE flow. Returns an access token."""
+    with httpx.Client(timeout=30, follow_redirects=False) as c:
+        meta = c.get(f"{server}/.well-known/oauth-authorization-server").json()
+
+        reg = c.post(
+            meta["registration_endpoint"],
+            json={
+                "client_name": "mcp-login",
+                "redirect_uris": [REDIRECT_URI],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            },
+        ).json()
+        client_id = reg["client_id"]
+
+        verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+        challenge = (
+            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+            .rstrip(b"=")
+            .decode()
+        )
+        state = secrets.token_urlsafe(16)
+
+        url = meta["authorization_endpoint"] + "?" + urlencode(
+            {
+                "client_id": client_id,
+                "redirect_uri": REDIRECT_URI,
+                "response_type": "code",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": state,
+                "scope": " ".join(meta.get("scopes_supported") or ["openid"]),
+            }
+        )
+
+        print(f"Approve in the browser:\n  {url}\n", file=sys.stderr)
+        if open_browser:
+            webbrowser.open(url)
+
+        srv = HTTPServer(("127.0.0.1", CALLBACK_PORT), _Catcher)
+        srv.serve_forever()  # _Catcher shuts it down
+        got = _Catcher.result
+
+        if "error" in got:
+            sys.exit(f"authorization failed: {got['error'][0]}")
+        if got.get("state", [None])[0] != state:
+            sys.exit("state mismatch; aborting")
+
+        # RFC 9207. Compared loosely on purpose: as of 2026-09 this gateway
+        # returns the issuer with a trailing slash while its own metadata omits
+        # it, and strict clients (Claude's connector) refuse the response over
+        # exactly that. Warn rather than fail, so this stays usable while the
+        # mismatch is outstanding.
+        iss = got.get("iss", [None])[0]
+        if iss and iss.rstrip("/") != meta["issuer"].rstrip("/"):
+            print(f"warning: iss {iss!r} != metadata issuer {meta['issuer']!r}", file=sys.stderr)
+
+        tok = c.post(
+            meta["token_endpoint"],
+            data={
+                "grant_type": "authorization_code",
+                "code": got["code"][0],
+                "redirect_uri": REDIRECT_URI,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            },
+        )
+        if tok.status_code != 200:
+            sys.exit(f"token exchange failed: {tok.status_code} {tok.text[:300]}")
+        blob = tok.json()
+
+    save_token(server, blob)
+    return blob["access_token"]
+
+
+class Session:
+    """A live MCP session: initialize once, then call."""
+
+    def __init__(self, server: str, token: str) -> None:
+        self.url = f"{server}/mcp"
+        self.token = token
+        self.sid: str | None = None
+        self.client = httpx.Client(timeout=120)
+
+    def _headers(self) -> dict[str, str]:
+        h = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {self.token}",
+        }
+        if self.sid:
+            h["Mcp-Session-Id"] = self.sid
+        return h
+
+    def rpc(self, method: str, params: dict | None = None, notify: bool = False) -> dict | None:
+        msg: dict = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        if not notify:
+            msg["id"] = 1
+        r = self.client.post(self.url, json=msg, headers=self._headers())
+        if r.status_code == 401:
+            sys.exit("401 — token rejected. Try --logout and re-run.")
+        r.raise_for_status()
+        if self.sid is None:
+            self.sid = r.headers.get("Mcp-Session-Id")
+        if notify:
+            return None
+        # streamable-http replies as SSE
+        for line in r.text.splitlines():
+            if line.startswith("data: "):
+                return json.loads(line[6:])
+        return r.json()
+
+    def open(self) -> dict:
+        init = self.rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp-login", "version": "1"},
+            },
+        )
+        self.rpc("notifications/initialized", notify=True)
+        return init or {}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--server", default=os.environ.get("MCP_SERVER", "https://mcp.danenberg.ai"))
+    ap.add_argument("--tools", action="store_true", help="list tool names and exit")
+    ap.add_argument("--schemas", action="store_true", help="show each tool's advertised inputSchema")
+    ap.add_argument("--call", metavar="NAME", help="call a tool")
+    ap.add_argument("--args", default="{}", help="JSON arguments for --call")
+    ap.add_argument("--raw", metavar="METHOD", help="send any JSON-RPC method")
+    ap.add_argument("--params", default="{}", help="JSON params for --raw")
+    ap.add_argument("--logout", action="store_true", help="forget the cached token")
+    ap.add_argument("--no-browser", action="store_true", help="print the URL, do not open it")
+    args = ap.parse_args()
+
+    server = args.server.rstrip("/")
+
+    if args.logout:
+        p = cache_path(server)
+        p.unlink(missing_ok=True)
+        print(f"forgot {p}")
+        return
+
+    token = cached_token(server) or authenticate(server, open_browser=not args.no_browser)
+
+    s = Session(server, token)
+    init = s.open()
+    info = init.get("result", {}).get("serverInfo", {})
+    print(f"# {info.get('name','?')} {info.get('version','')} @ {server}", file=sys.stderr)
+
+    if args.raw:
+        print(json.dumps(s.rpc(args.raw, json.loads(args.params)), indent=2))
+        return
+
+    if args.call:
+        r = s.rpc("tools/call", {"name": args.call, "arguments": json.loads(args.args)})
+        res = (r or {}).get("result", {})
+        for block in res.get("content", []):
+            if "text" in block:
+                print(block["text"])
+        if res.get("isError"):
+            sys.exit(1)
+        return
+
+    r = s.rpc("tools/list")
+    tools = (r or {}).get("result", {}).get("tools", [])
+    if args.schemas:
+        for t in tools:
+            print(f"{t['name']}\n    {json.dumps(t.get('inputSchema'))}")
+    elif args.tools:
+        for t in tools:
+            print(t["name"])
+    else:
+        stubbed = sum(1 for t in tools if t.get("inputSchema") == {"type": "object"})
+        size = sum(len(json.dumps(t)) for t in tools)
+        print(f"{len(tools)} tools, {stubbed} stubbed, ~{size // 4:,} tokens of advertisement")
+        for t in tools:
+            print(f"  {t['name']:28} {(t.get('description') or '')[:60]}")
+
+
+if __name__ == "__main__":
+    main()
