@@ -538,7 +538,11 @@ def create_gateway(
     # on the way out. Generic over the MCP `image` type; no per-server config.
     # Tuned via MCP_IMAGE_* env. See src/mcp_gateway/middleware/image_downscale.py
     # and plans/visual-context-management.md.
-    from mcp_gateway.middleware import ImageDownscaleMiddleware, StubSchemaMiddleware
+    from mcp_gateway.middleware import (
+        ImageDownscaleMiddleware,
+        StubSchemaMiddleware,
+        SummarizeDescriptionsMiddleware,
+    )
 
     _img_mw = ImageDownscaleMiddleware.from_env()
     if _img_mw is not None:
@@ -550,6 +554,24 @@ def create_gateway(
     _stub_mw = StubSchemaMiddleware.from_env()
     if _stub_mw is not None:
         gateway.add_middleware(_stub_mw)
+
+    # Rewrite advertised descriptions as model-written one-liners, memoized on
+    # content and filled in the background. Independent of the stub middleware:
+    # harness keeps full schemas and writes its own catalog, so it wants the
+    # prose and nothing else. Off unless MCP_SUMMARY=on; see
+    # src/mcp_gateway/middleware/summarize.py.
+    #
+    # ORDER IS LOAD-BEARING, and it is the opposite of what reading downwards
+    # suggests. FastMCP nests middleware: the one added first is outermost, so
+    # on the way *out* the one added last runs first. Registering the
+    # summarizer after the stub middleware therefore means it sees the raw
+    # upstream description and the stub middleware sees the summary — which is
+    # what we want, since a summary is already one sentence and the stub's trim
+    # is then a no-op over it. Swap them and the summarizer would be handed an
+    # already-truncated sentence and would cache a summary of a fragment.
+    _sum_mw = SummarizeDescriptionsMiddleware.from_env()
+    if _sum_mw is not None:
+        gateway.add_middleware(_sum_mw)
 
     # Track proxies needing warm-up on startup. FastMCP's stdio transport is
     # lazy: subprocesses don't spawn until first tool call. For wss-shim-backed

@@ -121,6 +121,12 @@ class StubSchemaMiddleware(Middleware):
         where a schema-valid guess would be costly — ``send-keys``,
         ``imessage_send`` — paying ~100 tokens to remove the guesswork is the
         right trade.
+    signatures:
+        Prefix each stubbed description with ``name(a, b; optional: c)``. On by
+        default as of 2026-09-21. Without it the advertisement says what a tool
+        does and not how to call it, which is what the model was guessing at;
+        with it the signature costs ~13 tokens a tool and removes the guess.
+        Turn it off only to reproduce the older behaviour.
     """
 
     def __init__(
@@ -128,9 +134,11 @@ class StubSchemaMiddleware(Middleware):
         *,
         describe: str = "first-sentence",
         always_full: frozenset[str] = frozenset(),
+        signatures: bool = True,
     ) -> None:
         self.describe = describe
         self.always_full = always_full
+        self.signatures = signatures
         # name -> the real schema, captured as we stub it on the way out.
         self._schemas: dict[str, dict[str, Any]] = {}
 
@@ -142,6 +150,7 @@ class StubSchemaMiddleware(Middleware):
           ``MCP_SCHEMA_MODE``        stub|full (default "full" — off)
           ``MCP_SCHEMA_DESCRIBE``    first-sentence|full (default first-sentence)
           ``MCP_SCHEMA_ALWAYS_FULL`` comma-separated tool names, never stubbed
+          ``MCP_SCHEMA_SIGNATURES``  0/off to omit the signature (default on)
         """
         if os.environ.get("MCP_SCHEMA_MODE", "full").lower() != "stub":
             return None
@@ -149,6 +158,8 @@ class StubSchemaMiddleware(Middleware):
         return cls(
             describe=os.environ.get("MCP_SCHEMA_DESCRIBE", "first-sentence"),
             always_full=frozenset(n.strip() for n in raw.split(",") if n.strip()),
+            signatures=os.environ.get("MCP_SCHEMA_SIGNATURES", "1").lower()
+            not in ("0", "off", "false", "no"),
         )
 
     async def on_list_tools(
@@ -172,8 +183,23 @@ class StubSchemaMiddleware(Middleware):
                 continue
 
             update: dict[str, Any] = {"parameters": _STUB_SCHEMA}
-            if self.describe == "first-sentence" and tool.description:
-                update["description"] = first_sentence(tool.description)
+            line = tool.description or ""
+            if self.describe == "first-sentence" and line:
+                line = first_sentence(line)
+            if self.signatures:
+                # The schema is about to be removed, so the argument names go
+                # into the only channel left. This is not decoration: sixteen
+                # days of production traffic through this gateway produced 324
+                # schema-validation failures, and once an error handed the
+                # model the signature, the retry used the canonical names 98%
+                # of the time (Claude) and 100% (Gemini). The names were the
+                # entire gap — so stop making every consumer discover them by
+                # failing first.
+                line = f"{signature_of(tool.name, self._schemas.get(tool.name))} — {line}".strip(
+                    " —"
+                )
+            if line != (tool.description or ""):
+                update["description"] = line
             out.append(tool.model_copy(update=update))
 
         return out

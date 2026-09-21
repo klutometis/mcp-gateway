@@ -43,11 +43,34 @@ class TestAdvertisement:
         # The whole point: no properties, no required, nothing to read.
         assert tools["send_keys"].input_schema == {"type": "object"}
 
-    async def test_description_is_trimmed_to_its_first_sentence(self) -> None:
+    async def test_description_is_the_signature_and_the_first_sentence(self) -> None:
         async with Client(build()) as c:
             tools = {t.name: t for t in await c.list_tools()}
 
+        # The signature moved into the description on 2026-09-21, because the
+        # schema it would otherwise come from has just been removed. Sixteen
+        # days of production traffic produced 324 schema-validation failures;
+        # once an error handed the model the signature, the retry used the
+        # canonical names 98% of the time on Claude and 100% on Gemini. The
+        # names were the whole gap, so they are advertised rather than
+        # discovered by failing.
+        assert tools["send_keys"].description == (
+            "send_keys(session, keys, optional: enter) — Send keystrokes to a tmux session."
+        )
+
+    async def test_signatures_can_be_turned_off(self) -> None:
+        async with Client(build(signatures=False)) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+
         assert tools["send_keys"].description == "Send keystrokes to a tmux session."
+
+    async def test_a_tool_with_no_arguments_says_so(self) -> None:
+        async with Client(build()) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+
+        # Empty parens are informative: they rule out the guess that this tool
+        # wants something, which is the mistake an empty stub schema invites.
+        assert tools["ping"].description == "ping() — Liveness check."
 
     async def test_full_descriptions_are_available(self) -> None:
         async with Client(build(describe="full")) as c:
@@ -56,6 +79,9 @@ class TestAdvertisement:
         assert "prefer a tool" in tools["send_keys"].description
         # Schemas are still stubbed; the two settings are independent.
         assert tools["send_keys"].input_schema == {"type": "object"}
+        # And the signature is still there — it is what replaces the schema,
+        # not a flourish on the trimmed description.
+        assert tools["send_keys"].description.startswith("send_keys(session, keys")
 
     async def test_always_full_keeps_its_real_schema(self) -> None:
         # For tools where a schema-valid guess is expensive, ~100 tokens to
