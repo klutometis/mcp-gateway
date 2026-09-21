@@ -155,7 +155,7 @@ stating precisely, because the two halves were doing different jobs.
 
 With the signature in the catalog line the model rarely needs the full schema,
 so promotion's benefit mostly evaporates while its costs remain. Dropping it
-alone gets the property Peter identified: a wrong guess is answered by a
+alone gets the property that motivated the change: a wrong guess is answered by a
 validation error that carries the shape, and **that error ages out of the
 context window on its own**. Cost proportional to recent use rather than
 permanent. Keeping repair keeps the tool callable while it happens.
@@ -288,9 +288,9 @@ call of the same tool by the same model in the same conversation:
 **The stub design works exactly as designed on Claude and Gemini, and does not
 function at all on GPT.** GPT never retries because it never guessed: an empty
 `properties` map tells it the tool takes no arguments, so there is nothing for
-the correction to correct. Peter's independent observation — "wondering whether
-the correction even reached GPT at all" — is confirmed, and it is structural
-rather than a context-handling quirk.
+the correction to correct. This was independently suspected from watching the
+transcripts — "wondering whether the correction even reached GPT at all" — and
+it is structural rather than a context-handling quirk.
 
 Claude's 118 errors over 547 calls break down as: 38% type/extra-property, 31%
 no args, 16% shape mismatch, 15% one-to-one rename. So even on a provider that
