@@ -75,6 +75,46 @@ log = logging.getLogger(__name__)
 
 _STUB_SCHEMA: dict[str, Any] = {"type": "object"}
 
+# Types worth keeping in ``names`` mode. ``string`` is deliberately absent: it
+# is what a model sends by default, so saying so spends tokens confirming the
+# status quo. Every type error observed across two corpora was a string sent
+# where a non-string was wanted — 15 integer, 7 array, 1 boolean — and never
+# the reverse.
+_KEEP_TYPES = frozenset({"integer", "number", "boolean", "array", "object"})
+
+
+def names_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
+    """The argument names, and nothing else worth paying for.
+
+    ``{"query": {}, "limit": {"type": "integer"}}`` — no descriptions, no
+    enums, no nested item schemas, no defaults. Those are the expensive parts
+    of a JSON Schema and the parts a model can infer or ask about; the names
+    are the cheap part it cannot guess.
+
+    WHY THIS EXISTS. ``stub`` mode replaced the whole schema with
+    ``{"type": "object"}`` and moved the argument names into the description,
+    which works for a model that reads descriptions. GPT does not: its
+    function-calling obeys the schema, so an empty ``properties`` reads as
+    *this tool takes no arguments* and it sends ``{}`` — 175 times out of 175
+    in production, with a 0% recovery rate, because there is no wrong guess for
+    the error to correct. The names have to be in the schema, which is the one
+    channel every consumer reads.
+    """
+    props = (schema or {}).get("properties") or {}
+    if not props:
+        return dict(_STUB_SCHEMA)
+    slim: dict[str, Any] = {}
+    for name, spec in props.items():
+        t = spec.get("type") if isinstance(spec, dict) else None
+        if isinstance(t, list):
+            t = next((x for x in t if x != "null"), None)
+        slim[name] = {"type": t} if t in _KEEP_TYPES else {}
+    out: dict[str, Any] = {"type": "object", "properties": slim}
+    required = [p for p in (schema or {}).get("required") or [] if p in props]
+    if required:
+        out["required"] = required
+    return out
+
 # A sentence ends at ". " — not at "e.g. " or "0.5 " or "Dr. ".
 _SENTENCE_END = re.compile(r"(?<![A-Z])(?<!\be\.g)(?<!\bi\.e)(?<!\bvs)\.(?=\s)")
 
@@ -135,10 +175,12 @@ class StubSchemaMiddleware(Middleware):
         describe: str = "first-sentence",
         always_full: frozenset[str] = frozenset(),
         signatures: bool = True,
+        mode: str = "stub",
     ) -> None:
         self.describe = describe
         self.always_full = always_full
         self.signatures = signatures
+        self.mode = mode
         # name -> the real schema, captured as we stub it on the way out.
         self._schemas: dict[str, dict[str, Any]] = {}
 
@@ -147,12 +189,19 @@ class StubSchemaMiddleware(Middleware):
         """Build from env, or ``None`` if disabled.
 
         Env (all optional):
-          ``MCP_SCHEMA_MODE``        stub|full (default "full" — off)
+          ``MCP_SCHEMA_MODE``        names|stub|full (default "full" — off)
           ``MCP_SCHEMA_DESCRIBE``    first-sentence|full (default first-sentence)
           ``MCP_SCHEMA_ALWAYS_FULL`` comma-separated tool names, never stubbed
-          ``MCP_SCHEMA_SIGNATURES``  0/off to omit the signature (default on)
+          ``MCP_SCHEMA_SIGNATURES``  0/off to omit the signature (default on;
+                                     ignored in ``names`` mode, where the
+                                     schema already names the arguments)
+
+        ``names`` is the one to want. ``stub`` is kept because it is what ran
+        from 2026-09-04 and its numbers are in notes/; it should not be chosen
+        fresh, since it is the mode that made GPT unable to call a tool at all.
         """
-        if os.environ.get("MCP_SCHEMA_MODE", "full").lower() != "stub":
+        mode = os.environ.get("MCP_SCHEMA_MODE", "full").lower()
+        if mode not in ("stub", "names"):
             return None
         raw = os.environ.get("MCP_SCHEMA_ALWAYS_FULL", "")
         return cls(
@@ -160,6 +209,7 @@ class StubSchemaMiddleware(Middleware):
             always_full=frozenset(n.strip() for n in raw.split(",") if n.strip()),
             signatures=os.environ.get("MCP_SCHEMA_SIGNATURES", "1").lower()
             not in ("0", "off", "false", "no"),
+            mode=mode,
         )
 
     async def on_list_tools(
@@ -182,11 +232,22 @@ class StubSchemaMiddleware(Middleware):
                 out.append(tool)
                 continue
 
-            update: dict[str, Any] = {"parameters": _STUB_SCHEMA}
+            real = self._schemas.get(tool.name)
+            # `names` keeps the argument names in the schema; `stub` throws the
+            # whole schema away and reconstructs the names in prose. The
+            # difference only matters to a consumer that reads one channel and
+            # not the other, which is exactly the case that forced this: see
+            # names_schema.
+            update: dict[str, Any] = {
+                "parameters": names_schema(real) if self.mode == "names" else _STUB_SCHEMA
+            }
             line = tool.description or ""
             if self.describe == "first-sentence" and line:
                 line = first_sentence(line)
-            if self.signatures:
+            # In `names` mode the schema already carries them, so a signature
+            # in the description would say the same thing twice — and it is
+            # the redundancy that pays for the change.
+            if self.signatures and self.mode != "names":
                 # The schema is about to be removed, so the argument names go
                 # into the only channel left. This is not decoration: sixteen
                 # days of production traffic through this gateway produced 324

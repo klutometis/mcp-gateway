@@ -7,6 +7,8 @@ actually receive over ``tools/list`` and ``tools/call``.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastmcp import Client, FastMCP
 
@@ -260,3 +262,100 @@ class TestFirstSentence:
     ) -> None:
         # A description truncated at "e.g." is worse than no trimming at all.
         assert first_sentence(text) == expected
+
+
+class TestNamesMode:
+    """`names` keeps the argument names in the schema, where every model reads.
+
+    `stub` mode moved them into the description instead, which works for a
+    model that reads descriptions and fails completely for one that does not.
+    GPT's function-calling obeys the schema: an empty `properties` reads as
+    *this tool takes no arguments*, so it sent `{}` 175 times out of 175 in
+    production with a 0% recovery rate — there was no wrong guess for the
+    error to correct. These tests pin the shape that fixes it.
+    """
+
+    async def test_the_schema_names_the_arguments(self) -> None:
+        async with Client(build(mode="names")) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+
+        schema = tools["send_keys"].input_schema
+        assert set(schema["properties"]) == {"session", "keys", "enter"}
+        assert schema["required"] == ["session", "keys"]
+
+    async def test_non_string_types_are_kept_and_strings_are_not(self) -> None:
+        async with Client(build(mode="names")) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+
+        props = tools["send_keys"].input_schema["properties"]
+        # `string` is the model's default, so declaring it buys nothing; every
+        # type error measured was a string sent where a non-string was wanted.
+        assert props["session"] == {}
+        assert props["keys"] == {}
+        assert props["enter"] == {"type": "boolean"}
+
+    async def test_the_expensive_parts_are_still_gone(self) -> None:
+        async with Client(build(mode="names")) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+
+        # Names are cheap; per-argument prose, enums and nested item schemas
+        # are what made a full schema cost 149 tokens a tool.
+        dumped = json.dumps(tools["send_keys"].input_schema)
+        assert "description" not in dumped
+        assert "Keystrokes" not in dumped
+
+    async def test_the_signature_is_not_repeated_in_the_description(self) -> None:
+        # The schema already names the arguments, so a signature in the prose
+        # would say it twice — and dropping it is what pays for the change.
+        async with Client(build(mode="names")) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+
+        assert tools["send_keys"].description == "Send keystrokes to a tmux session."
+
+    async def test_a_no_argument_tool_is_still_an_empty_object(self) -> None:
+        async with Client(build(mode="names")) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+
+        assert tools["ping"].input_schema == {"type": "object"}
+
+    async def test_a_wrong_type_is_still_caught_by_the_real_schema(self) -> None:
+        # The advertisement is slimmed; validation is not. The gateway still
+        # holds the upstream schema and answers a bad call with the signature.
+        async with Client(build(mode="names")) as c:
+            # List first. The middleware learns the real schemas on the way
+            # past, which is how a client behaves and how validation gets
+            # anything to validate against — the first draft of this test
+            # skipped it and passed a bad argument straight through.
+            await c.list_tools()
+            result = await c.call_tool(
+                "send_keys", {"session": "s", "enter": True}, raise_on_error=False
+            )
+
+        assert result.is_error
+        # Answered with the signature, not the upstream's own complaint.
+        assert "send_keys(session, keys" in result.content[0].text
+
+    async def test_stub_mode_is_unchanged(self) -> None:
+        # The old mode still behaves exactly as it did, so the numbers recorded
+        # in notes/ remain reproducible.
+        async with Client(build(mode="stub")) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+
+        assert tools["send_keys"].input_schema == {"type": "object"}
+        assert tools["send_keys"].description.startswith("send_keys(session, keys")
+
+
+class TestModeFromEnv:
+    def test_names_is_selectable(self, monkeypatch) -> None:
+        monkeypatch.setenv("MCP_SCHEMA_MODE", "names")
+        mw = StubSchemaMiddleware.from_env()
+        assert mw is not None and mw.mode == "names"
+
+    def test_full_still_means_off(self, monkeypatch) -> None:
+        monkeypatch.setenv("MCP_SCHEMA_MODE", "full")
+        assert StubSchemaMiddleware.from_env() is None
+
+    def test_an_unknown_mode_is_off_rather_than_a_guess(self, monkeypatch) -> None:
+        # A typo in a deploy variable must not silently pick a behaviour.
+        monkeypatch.setenv("MCP_SCHEMA_MODE", "nmaes")
+        assert StubSchemaMiddleware.from_env() is None
