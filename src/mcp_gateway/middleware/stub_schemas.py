@@ -83,6 +83,40 @@ _STUB_SCHEMA: dict[str, Any] = {"type": "object"}
 _KEEP_TYPES = frozenset({"integer", "number", "boolean", "array", "object"})
 
 
+def _slim(spec: Any) -> dict[str, Any]:
+    """One property, reduced to its type — and, for an array, its item type.
+
+    ``items`` is not optional decoration. Gemini rejects the WHOLE tool array
+    with ``function_declarations[0].parameters.properties[excludeTags].items:
+    missing field`` if any array lacks it, so a single bare ``{"type":
+    "array"}`` anywhere makes every tool uncallable for that provider. The
+    first version of this function dropped ``items`` and did exactly that to 44
+    properties across these 109 tools.
+
+    Kept deliberately shallow otherwise: an object's own properties are not
+    recursed into, because that is where the token weight lives and a model
+    that knows an argument is an object can ask. Arrays are the exception only
+    because the item type is load-bearing for validation upstream.
+    """
+    if not isinstance(spec, dict):
+        return {}
+    t = spec.get("type")
+    if isinstance(t, list):
+        t = next((x for x in t if x != "null"), None)
+    if t not in _KEEP_TYPES:
+        return {}
+    out: dict[str, Any] = {"type": t}
+    if t == "array":
+        # Recurse: `create_sheet.data` is an array of arrays of strings, and
+        # the inner array needs its own `items` for the same reason.
+        inner = spec.get("items")
+        out["items"] = _slim(inner) if isinstance(inner, dict) else {"type": "string"}
+        if not out["items"]:
+            # An untyped item still has to be *something* Gemini accepts.
+            out["items"] = {"type": "string"}
+    return out
+
+
 def names_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
     """The argument names, and nothing else worth paying for.
 
@@ -103,12 +137,7 @@ def names_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
     props = (schema or {}).get("properties") or {}
     if not props:
         return dict(_STUB_SCHEMA)
-    slim: dict[str, Any] = {}
-    for name, spec in props.items():
-        t = spec.get("type") if isinstance(spec, dict) else None
-        if isinstance(t, list):
-            t = next((x for x in t if x != "null"), None)
-        slim[name] = {"type": t} if t in _KEEP_TYPES else {}
+    slim: dict[str, Any] = {name: _slim(spec) for name, spec in props.items()}
     out: dict[str, Any] = {"type": "object", "properties": slim}
     required = [p for p in (schema or {}).get("required") or [] if p in props]
     if required:

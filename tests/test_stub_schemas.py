@@ -13,6 +13,7 @@ import pytest
 from fastmcp import Client, FastMCP
 
 from mcp_gateway.middleware.stub_schemas import (
+    names_schema,
     StubSchemaMiddleware,
     first_sentence,
     signature_of,
@@ -32,6 +33,11 @@ def build(**kwargs) -> FastMCP:
     def ping() -> str:
         """Liveness check."""
         return "pong"
+
+    @server.tool
+    def tag_all(tags: list[str], note: str = "") -> str:
+        """Apply tags. Exists so an array argument is under test."""
+        return ",".join(tags)
 
     server.add_middleware(StubSchemaMiddleware(**kwargs))
     return server
@@ -311,6 +317,80 @@ class TestNamesMode:
             tools = {t.name: t for t in await c.list_tools()}
 
         assert tools["send_keys"].description == "Send keystrokes to a tmux session."
+
+    async def test_an_array_keeps_its_item_type(self) -> None:
+        """Gemini rejects the WHOLE request if any array lacks `items`.
+
+            GenerateContentRequest.tools[0].function_declarations[0]
+              .parameters.properties[excludeTags].items: missing field
+
+        Not that one tool — every tool, for that provider, with no clue in our
+        logs. The first version of names mode dropped `items` and did this to
+        44 properties across the 109 tools on the live gateway, and it reached
+        production. tools/check_advertisement.py now asks each provider
+        directly, which is the only authority on what they accept.
+        """
+        async with Client(build(mode="names")) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+
+        assert tools["tag_all"].input_schema["properties"]["tags"] == {
+            "type": "array",
+            "items": {"type": "string"},
+        }
+
+    def test_a_nested_array_keeps_items_all_the_way_down(self) -> None:
+        # `create_sheet.data` is an array of arrays of strings; the inner array
+        # needs its own `items` for exactly the same reason as the outer one.
+        out = names_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "data": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}}
+                },
+            }
+        )
+        assert out["properties"]["data"] == {
+            "type": "array",
+            "items": {"type": "array", "items": {"type": "string"}},
+        }
+
+    def test_an_array_with_no_upstream_items_still_gets_one(self) -> None:
+        # A schema we cannot learn the item type from must not produce an
+        # advertisement that fails validation; string is the safe default.
+        out = names_schema({"type": "object", "properties": {"xs": {"type": "array"}}})
+        assert out["properties"]["xs"] == {"type": "array", "items": {"type": "string"}}
+
+    def test_item_constraints_are_dropped_but_the_type_survives(self) -> None:
+        # `items` must exist; its enum, pattern and minLength are the expensive
+        # parts and are not what the provider is checking for.
+        out = names_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["a", "b"], "minLength": 1},
+                    }
+                },
+            }
+        )
+        assert out["properties"]["fields"] == {"type": "array", "items": {"type": "string"}}
+
+    def test_an_array_of_objects_does_not_recurse_into_the_object(self) -> None:
+        # The item type is load-bearing for validation; the object's own
+        # properties are where the tokens are, and a model can ask.
+        out = names_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "attendees": {
+                        "type": "array",
+                        "items": {"type": "object", "properties": {"email": {"type": "string"}}},
+                    }
+                },
+            }
+        )
+        assert out["properties"]["attendees"] == {"type": "array", "items": {"type": "object"}}
 
     async def test_a_no_argument_tool_is_still_an_empty_object(self) -> None:
         async with Client(build(mode="names")) as c:
