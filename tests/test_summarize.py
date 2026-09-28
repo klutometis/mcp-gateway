@@ -296,3 +296,69 @@ class TestParsing:
 
     def test_non_string_values_are_dropped(self) -> None:
         assert _parse_lines('{"a": "one", "b": 2, "c": null}') == {"a": "one"}
+
+
+class TestPinnedLines:
+    """A tool whose servers.json entry sets ``meta.catalog_line`` is advertised
+    with that line and never summarized -- through the same proxy, enable and
+    ToolTransform path the gateway builds (gateway.py _build_single_instance)."""
+
+    LINE = ("Look up a word in dictionaries for 21 languages: English, Greek, Latin, "
+            "Old Javanese, Old Irish, Old Norse, Sanskrit, Pali, Persian, Coptic, "
+            "Finnish, K'iche' … (`dictionaries`).")
+
+    def gateway(self, mw: SummarizeDescriptionsMiddleware) -> FastMCP:
+        from fastmcp.server import create_proxy
+        from fastmcp.server.transforms import ToolTransform
+
+        upstream = FastMCP("lexicon")
+
+        @upstream.tool
+        def lookup(word: str) -> str:
+            """Look up a headword in the OED. Long upstream prose follows."""
+            return word
+
+        @upstream.tool
+        def stats() -> str:
+            """Which dictionaries are loaded. More prose."""
+            return "{}"
+
+        import tempfile
+
+        from mcp_gateway.gateway import load_servers
+
+        raw = {"lexicon": {"transport": "stdio", "command": "true", "tools": {
+            "lookup": {"name": "define", "description": self.LINE + " Pass the language as `source`.",
+                       "meta": {"catalog_line": self.LINE}},
+            "stats": {"name": "lexicon_stats", "description": "Which dictionaries are loaded. More."},
+        }}}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(raw, f)
+        tool_configs = load_servers(f.name)["lexicon"]["tools"]
+        Path(f.name).unlink()
+        proxy = create_proxy(upstream, name="Proxy-lexicon")
+        proxy.enable(names=set(tool_configs), components={"tool"}, only=True)
+        proxy.add_transform(ToolTransform(tool_configs))
+        gw = FastMCP("gw")
+        gw.mount(proxy)
+        gw.add_middleware(mw)
+        return gw
+
+    async def test_pinned_line_is_advertised_verbatim_and_not_summarized(self) -> None:
+        model = FakeModel()
+        mw = summarizer(model)
+        async with Client(self.gateway(mw)) as c:
+            await c.list_tools()
+            await settle(mw)
+            tools = {t.name: t for t in await c.list_tools()}
+
+        assert tools["define"].description == self.LINE
+        asked = {name for call in model.calls for name, _ in call}
+        assert "define" not in asked
+        assert "lexicon_stats" in asked
+        assert tools["lexicon_stats"].description == "Summary of lexicon_stats."
+
+    async def test_pinned_line_still_calls_through(self) -> None:
+        async with Client(self.gateway(summarizer(FakeModel()))) as c:
+            r = await c.call_tool("define", {"word": "hyaṅ"})
+        assert r.data == "hyaṅ"

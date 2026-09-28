@@ -387,6 +387,10 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
                     name=tc['name'],
                     title=tc.get('title'),
                     description=tc.get('description'),
+                    # meta.catalog_line pins the one-line advertisement past the
+                    # summarizer (middleware/summarize.py); passed only when set,
+                    # so an unset meta leaves the upstream's own untouched.
+                    **({'meta': tc['meta']} if tc.get('meta') else {}),
                 )
                 for upstream, tc in raw_tools.items()
             }

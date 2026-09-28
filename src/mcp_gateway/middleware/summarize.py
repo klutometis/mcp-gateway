@@ -103,6 +103,26 @@ Tools:
 """
 
 
+# A tool whose config pins its catalog line, in servers.json:
+#
+#     "lookup": {"name": "define", "description": "...",
+#                "meta": {"catalog_line": "Look up a word in ... ."}}
+#
+# is advertised with that line verbatim and never sent to the model. For the
+# rare line whose *content* is the point and which a summary flattens: the
+# lexicon's `define` names the 21 languages it has dictionaries for, and Haiku,
+# told to drop examples, rewrote it as "dictionaries for 21 languages" -- the
+# exact omission that left an Old Javanese reader believing there was no
+# dictionary for it. `meta` because ToolTransformConfig forbids unknown keys.
+CATALOG_LINE_KEY = "catalog_line"
+
+
+def pinned_line(tool: Tool) -> str | None:
+    meta = getattr(tool, "meta", None) or {}
+    line = meta.get(CATALOG_LINE_KEY)
+    return line.strip() if isinstance(line, str) and line.strip() else None
+
+
 def content_key(name: str, description: str) -> str:
     """Cache key for one tool's description.
 
@@ -264,6 +284,10 @@ class SummarizeDescriptionsMiddleware(Middleware):
         out: list[Tool] = []
         for tool in tools:
             desc = tool.description or ""
+            pinned = pinned_line(tool)
+            if pinned:
+                out.append(tool.model_copy(update={"description": pinned}))
+                continue
             if not desc:
                 out.append(tool)
                 continue
