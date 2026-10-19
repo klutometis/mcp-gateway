@@ -24,6 +24,7 @@ from mcp_gateway.middleware.summarize import (
     SummaryCache,
     _parse_lines,
     content_key,
+    thinking_off,
 )
 
 # A description this gateway's regex gets wrong, and the direction of the
@@ -296,3 +297,47 @@ class TestParsing:
 
     def test_non_string_values_are_dropped(self) -> None:
         assert _parse_lines('{"a": "one", "b": 2, "c": null}') == {"a": "one"}
+
+
+class TestRequestShape:
+    """What goes over the wire to /v1/messages, and how the reply is read."""
+
+    async def _ask_with(self, monkeypatch, model: str, content: list[dict]) -> tuple[dict, dict]:
+        sent: dict = {}
+
+        class Resp:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict:
+                return {"content": content}
+
+        async def post(self, url, **kw):
+            sent.update(kw["json"])
+            return Resp()
+
+        monkeypatch.setattr("httpx.AsyncClient.post", post)
+        mw = SummarizeDescriptionsMiddleware(model=model, api_key="k")
+        return sent, await mw._ask([("scrape", AWKWARD)])
+
+    async def test_haiku_turns_thinking_off_and_sends_no_sampling(self, monkeypatch) -> None:
+        sent, _ = await self._ask_with(monkeypatch, "claude-haiku-5-5", [])
+        assert sent["thinking"] == {"type": "disabled"}
+        assert not {"temperature", "top_p", "top_k"} & sent.keys()
+
+    async def test_sonnet_5_5_gets_between_tools_not_disabled(self, monkeypatch) -> None:
+        # Sonnet 5.5 answers `disabled` with a 400.
+        sent, _ = await self._ask_with(monkeypatch, "claude-sonnet-5-5", [])
+        assert sent["thinking"] == {"type": "between_tools"}
+
+    async def test_a_leading_thinking_block_is_skipped(self, monkeypatch) -> None:
+        content = [
+            {"type": "thinking", "thinking": "", "signature": "x"},
+            {"type": "text", "text": '{"scrape": '},
+            {"type": "text", "text": '"Fetch a page."}'},
+        ]
+        _, lines = await self._ask_with(monkeypatch, "claude-haiku-5-5", content)
+        assert lines == {"scrape": "Fetch a page."}
+
+    def test_thinking_off_is_disabled_for_haiku_4_5_too(self) -> None:
+        assert thinking_off("claude-haiku-4-5") == {"type": "disabled"}

@@ -180,9 +180,9 @@ class SummarizeDescriptionsMiddleware(Middleware):
     model:
         Anthropic model id. Haiku is the intended one; this is a short, highly
         constrained rewrite and the cheapest model does it well. The request
-        sends no ``temperature``/``top_p``/``thinking`` on purpose: Haiku 5.5
-        and Sonnet 5.x reject sampling parameters other than the default, and
-        with ``thinking`` omitted Haiku 5.5 answers in plain text.
+        sends no ``temperature``/``top_p`` on purpose (Haiku 5.5 and Sonnet
+        5.x reject non-default sampling) and turns thinking off explicitly;
+        see :func:`thinking_off`.
     api_key:
         ``None`` disables summarization entirely — every line falls back to the
         regex, which is today's behaviour.
@@ -330,6 +330,7 @@ class SummarizeDescriptionsMiddleware(Middleware):
                 json={
                     "model": self.model,
                     "max_tokens": 64 * len(chunk) + 256,
+                    "thinking": thinking_off(self.model),
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
@@ -343,6 +344,17 @@ class SummarizeDescriptionsMiddleware(Middleware):
             if isinstance(b, dict) and b.get("type") == "text"
         )
         return _parse_lines(text)
+
+
+def thinking_off(model: str) -> dict[str, str]:
+    """The ``thinking`` value that means "don't" for ``model``.
+
+    Haiku 5.5 thinks unasked (5 of 6 short calls in one measurement, two of
+    them spending all of max_tokens before any text), so omitting the field
+    is not enough; ``disabled`` is explicit and Haiku 4.5 accepts it too.
+    Sonnet 5.5 rejects ``disabled`` with a 400 and wants ``between_tools``.
+    """
+    return {"type": "between_tools" if "sonnet-5-5" in model else "disabled"}
 
 
 def _parse_lines(text: str) -> dict[str, str]:

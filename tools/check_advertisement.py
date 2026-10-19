@@ -57,6 +57,8 @@ async def anthropic(tools: list[dict[str, Any]]) -> tuple[bool, str]:
     body = {
         "model": "claude-haiku-5-5",
         "max_tokens": 1,
+        # Only the status code matters; don't let Haiku 5.5 think unasked.
+        "thinking": {"type": "disabled"},
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [
             {"name": t["name"], "description": t.get("description") or "", "input_schema": t["schema"]}
