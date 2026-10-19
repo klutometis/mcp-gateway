@@ -55,7 +55,7 @@ async def anthropic(tools: list[dict[str, Any]]) -> tuple[bool, str]:
     if not key:
         return True, "skipped (no ANTHROPIC_API_KEY)"
     body = {
-        "model": "claude-haiku-4-5",
+        "model": "claude-haiku-5-5",
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [

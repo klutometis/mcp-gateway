@@ -179,7 +179,10 @@ class SummarizeDescriptionsMiddleware(Middleware):
     ----------
     model:
         Anthropic model id. Haiku is the intended one; this is a short, highly
-        constrained rewrite and the cheapest model does it well.
+        constrained rewrite and the cheapest model does it well. The request
+        sends no ``temperature``/``top_p``/``thinking`` on purpose: Haiku 5.5
+        and Sonnet 5.x reject sampling parameters other than the default, and
+        with ``thinking`` omitted Haiku 5.5 answers in plain text.
     api_key:
         ``None`` disables summarization entirely — every line falls back to the
         regex, which is today's behaviour.
@@ -198,7 +201,7 @@ class SummarizeDescriptionsMiddleware(Middleware):
     def __init__(
         self,
         *,
-        model: str = "claude-haiku-4-5",
+        model: str = "claude-haiku-5-5",
         api_key: str | None = None,
         cache_path: Path | None = None,
         max_chars: int = 180,
@@ -222,7 +225,7 @@ class SummarizeDescriptionsMiddleware(Middleware):
 
         Env (all optional):
           ``MCP_SUMMARY``        on/off (default "off")
-          ``MCP_SUMMARY_MODEL``  model id (default claude-haiku-4-5)
+          ``MCP_SUMMARY_MODEL``  model id (default claude-haiku-5-5)
           ``MCP_SUMMARY_CACHE``  path (default ~/.cache/mcp-gateway/summaries.json)
           ``MCP_SUMMARY_MAX``    max chars per line (default 180)
           ``ANTHROPIC_API_KEY``  required; without it this returns None
@@ -240,7 +243,7 @@ class SummarizeDescriptionsMiddleware(Middleware):
             else Path.home() / ".cache" / "mcp-gateway" / "summaries.json"
         )
         return cls(
-            model=os.environ.get("MCP_SUMMARY_MODEL", "claude-haiku-4-5"),
+            model=os.environ.get("MCP_SUMMARY_MODEL", "claude-haiku-5-5"),
             api_key=key,
             cache_path=cache_path,
             max_chars=int(os.environ.get("MCP_SUMMARY_MAX", "180")),
@@ -332,7 +335,13 @@ class SummarizeDescriptionsMiddleware(Middleware):
             )
             resp.raise_for_status()
             body = resp.json()
-        text = "".join(b.get("text", "") for b in body.get("content", []) if isinstance(b, dict))
+        # Join the text blocks, never content[0]: a Sonnet 5.x override can
+        # lead with a (sometimes empty) thinking block.
+        text = "".join(
+            b.get("text", "")
+            for b in body.get("content", [])
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
         return _parse_lines(text)
 
 
