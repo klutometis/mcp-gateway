@@ -579,7 +579,16 @@ def create_gateway(
     # shim listens, and the shim doesn't listen until something forces a
     # connection. We trigger that connection at boot via list_tools().
     # See plans/wss-shim-lifecycle.md.
-    warmup_proxies: list[tuple[str, FastMCP]] = []
+    warmup_proxies: list[tuple[str, Any]] = []
+
+    # Each backend's list calls get a deadline, and a late backend is served
+    # from its last answer, so one slow upstream can't hold the whole
+    # tools/list hostage. See src/mcp_gateway/deadline.py.
+    from fastmcp.server.providers.fastmcp_provider import FastMCPProvider
+
+    from mcp_gateway.deadline import DeadlineProvider, list_deadline_from_env
+
+    list_deadline = list_deadline_from_env()
 
     for name, server_config in servers.items():
         tool_configs = server_config["tools"]
@@ -603,8 +612,25 @@ def create_gateway(
                 create_proxy=create_proxy,
             )
 
-        gateway.mount(mounted)
-        warmup_proxies.append((name, mounted))
+        if list_deadline is None:
+            gateway.mount(mounted)
+            warmup_proxies.append((name, mounted))
+        else:
+            # What mount() does for a server with no namespace and no
+            # renames, with the deadline wrapped around it.
+            bounded = DeadlineProvider(
+                FastMCPProvider(mounted),
+                name=name,
+                deadline=list_deadline,
+                # A backend that forwards the caller upstream may list
+                # differently per caller: bound it, never remember it.
+                remember=not (
+                    server_config.get("forward_token")
+                    or server_config.get("forward_identity")
+                ),
+            )
+            gateway.add_provider(bounded)
+            warmup_proxies.append((name, bounded))
 
     # Stash on the gateway for entrypoint code to schedule as a startup hook.
     gateway._warmup_proxies = warmup_proxies  # type: ignore[attr-defined]
@@ -902,7 +928,11 @@ async def warm_proxies(gateway: FastMCP) -> None:
     print(f"Warming {len(proxies)} upstream proxies (forcing stdio subprocess spawn)")
     for name, proxy in proxies:
         try:
-            tools = await proxy.list_tools()
+            # A DeadlineProvider's warm() waits as long as the backend takes
+            # and remembers the answer, so the first tools/list after boot
+            # has it even if the backend is slow.
+            warm = getattr(proxy, "warm", None)
+            tools = await (warm() if warm is not None else proxy.list_tools())
             print(f"  warmed '{name}': {len(tools)} tools available")
         except Exception as e:
             print(
