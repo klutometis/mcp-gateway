@@ -794,6 +794,56 @@ def _proxy_config_for_http(
     }
 
 
+def _proxy_target(proxy_config: dict[str, Any]) -> Any:
+    """What create_proxy is pointed at for one backing.
+
+    A streamable-HTTP backing gets a transport that sends that backing exactly
+    the headers configured for it in servers.json, and nothing from the
+    caller. FastMCP proxies forward the caller's inbound HTTP headers
+    upstream, Authorization included (``forward_incoming_headers``, forced on
+    for every proxy client). Two things went wrong with that:
+
+    - **Clobbered credentials.** The inbound header arrives lowercase
+      (``authorization``) and the configured one is ``Authorization``. The
+      merge is a dict union, so both survived, and the backend saw the
+      caller's token. On mcp.danenberg.ai, llm-multiplex's OAuth bearer
+      reached whatsapp-mcp in place of WHATSAPP_MCP_TOKEN: 401, and
+      whatsapp_* vanished from the gateway (Railway log, 2026-10-19 04:49:43).
+      Reproduced on the laptop: a caller sending any Authorization header
+      turned 112 tools into 108.
+    - **A leaked token.** A backing with no Authorization of its own received
+      the caller's gateway access token.
+
+    A backend that needs the caller's identity says so (``forward_token``,
+    ``forward_identity``), and those build their own clients (identity.py).
+    stdio has no headers. Anything else goes through FastMCP's MCPConfig
+    path, as before.
+    """
+    if proxy_config.get("transport") not in ("streamable-http", "http"):
+        return {"mcpServers": {"default": proxy_config}}
+
+    from fastmcp.client.transports import StreamableHttpTransport
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    configured = dict(proxy_config.get("headers") or {})
+
+    def only_configured_headers(
+        headers: dict[str, str] | None = None,
+        timeout: Any = None,
+        auth: Any = None,
+        **_: Any,
+    ):
+        # `headers` is the caller's forwardable headers merged with ours;
+        # send ours alone.
+        return create_mcp_http_client(headers=dict(configured), timeout=timeout, auth=auth)
+
+    return StreamableHttpTransport(
+        proxy_config["url"],
+        headers=configured,
+        httpx_client_factory=only_configured_headers,
+    )
+
+
 def _build_single_instance(
     *,
     name: str,
@@ -861,7 +911,7 @@ def _build_single_instance(
         proxy_config = _proxy_config_for_http(server_config)
 
     proxy = create_proxy(
-        {"mcpServers": {"default": proxy_config}},
+        _proxy_target(proxy_config),
         name=f"Proxy-{name}",
     )
     # "*" means expose every upstream tool as-is: skip the enable(only=True)
@@ -913,7 +963,7 @@ def _build_multi_instance(
             if isinstance(url, str) and url:
                 instance_urls[inst_name] = url
         backing = create_proxy(
-            {"mcpServers": {"default": proxy_config}},
+            _proxy_target(proxy_config),
             name=f"Proxy-{name}-{inst_name}",
         )
         # "*" exposes every upstream tool as-is (no subset/rename).
