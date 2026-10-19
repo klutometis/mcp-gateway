@@ -181,8 +181,10 @@ class SummarizeDescriptionsMiddleware(Middleware):
         Anthropic model id. Haiku is the intended one; this is a short, highly
         constrained rewrite and the cheapest model does it well. The request
         sends no ``temperature``/``top_p`` on purpose (Haiku 5.5 and Sonnet
-        5.x reject non-default sampling) and turns thinking off explicitly;
-        see :func:`thinking_off`.
+        5.x reject non-default sampling) and omits ``thinking``: on 5.x that
+        is adaptive (the model decides, and on short rewrites rarely thinks),
+        and it stays valid if ``MCP_SUMMARY_MODEL`` points back at a 4.5.
+        Nobody waits on a fill, so no ``effort`` is sent either.
     api_key:
         ``None`` disables summarization entirely — every line falls back to the
         regex, which is today's behaviour.
@@ -329,8 +331,10 @@ class SummarizeDescriptionsMiddleware(Middleware):
                 },
                 json={
                     "model": self.model,
-                    "max_tokens": 64 * len(chunk) + 256,
-                    "thinking": thinking_off(self.model),
+                    # A ceiling, not a cost. Haiku 5.5 does think on a full
+                    # batch (8-10 of 10 calls, up to ~2,500 output tokens for
+                    # 25 lines, 2026-10-19), so leave it ample room.
+                    "max_tokens": 64 * len(chunk) + 4000,
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
@@ -344,17 +348,6 @@ class SummarizeDescriptionsMiddleware(Middleware):
             if isinstance(b, dict) and b.get("type") == "text"
         )
         return _parse_lines(text)
-
-
-def thinking_off(model: str) -> dict[str, str]:
-    """The ``thinking`` value that means "don't" for ``model``.
-
-    Haiku 5.5 thinks unasked (5 of 6 short calls in one measurement, two of
-    them spending all of max_tokens before any text), so omitting the field
-    is not enough; ``disabled`` is explicit and Haiku 4.5 accepts it too.
-    Sonnet 5.5 rejects ``disabled`` with a 400 and wants ``between_tools``.
-    """
-    return {"type": "between_tools" if "sonnet-5-5" in model else "disabled"}
 
 
 def _parse_lines(text: str) -> dict[str, str]:

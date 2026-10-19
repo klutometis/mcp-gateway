@@ -23,7 +23,7 @@ providers do, each with its own unpublished subset of JSON Schema, and the only
 authority on whether an advertisement is valid is the provider itself. Unit
 tests assert what we *meant*. This asks what they will *take*.
 
-It is cheap — one minimal request per provider, max_tokens 1, no tool actually
+It is cheap — one minimal request per provider ("hi"), no tool actually
 invoked — so there is no reason not to run it before a deploy that touches
 schema shape.
 """
@@ -56,9 +56,8 @@ async def anthropic(tools: list[dict[str, Any]]) -> tuple[bool, str]:
         return True, "skipped (no ANTHROPIC_API_KEY)"
     body = {
         "model": "claude-haiku-5-5",
-        "max_tokens": 1,
-        # Only the status code matters; don't let Haiku 5.5 think unasked.
-        "thinking": {"type": "disabled"},
+        # Only the status code matters, but leave adaptive thinking room.
+        "max_tokens": 2000,
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [
             {"name": t["name"], "description": t.get("description") or "", "input_schema": t["schema"]}

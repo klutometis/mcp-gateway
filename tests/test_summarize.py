@@ -24,7 +24,6 @@ from mcp_gateway.middleware.summarize import (
     SummaryCache,
     _parse_lines,
     content_key,
-    thinking_off,
 )
 
 # A description this gateway's regex gets wrong, and the direction of the
@@ -320,15 +319,13 @@ class TestRequestShape:
         mw = SummarizeDescriptionsMiddleware(model=model, api_key="k")
         return sent, await mw._ask([("scrape", AWKWARD)])
 
-    async def test_haiku_turns_thinking_off_and_sends_no_sampling(self, monkeypatch) -> None:
-        sent, _ = await self._ask_with(monkeypatch, "claude-haiku-5-5", [])
-        assert sent["thinking"] == {"type": "disabled"}
-        assert not {"temperature", "top_p", "top_k"} & sent.keys()
-
-    async def test_sonnet_5_5_gets_between_tools_not_disabled(self, monkeypatch) -> None:
-        # Sonnet 5.5 answers `disabled` with a 400.
-        sent, _ = await self._ask_with(monkeypatch, "claude-sonnet-5-5", [])
-        assert sent["thinking"] == {"type": "between_tools"}
+    async def test_thinking_is_left_adaptive_with_headroom(self, monkeypatch) -> None:
+        # Omitting `thinking` is adaptive on 5.x and still valid on 4.5; the
+        # ceiling has to leave room for it. No sampling params, no effort.
+        for model in ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"):
+            sent, _ = await self._ask_with(monkeypatch, model, [])
+            assert not {"thinking", "output_config", "temperature", "top_p", "top_k"} & sent.keys()
+            assert sent["max_tokens"] >= 2000
 
     async def test_a_leading_thinking_block_is_skipped(self, monkeypatch) -> None:
         content = [
@@ -338,6 +335,3 @@ class TestRequestShape:
         ]
         _, lines = await self._ask_with(monkeypatch, "claude-haiku-5-5", content)
         assert lines == {"scrape": "Fetch a page."}
-
-    def test_thinking_off_is_disabled_for_haiku_4_5_too(self) -> None:
-        assert thinking_off("claude-haiku-4-5") == {"type": "disabled"}
