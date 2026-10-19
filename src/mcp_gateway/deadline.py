@@ -13,8 +13,16 @@ lost all 112 tools to wait for 8.
 ``list_*`` calls ``deadline`` seconds:
 
 - **In time:** the answer, which is also remembered.
-- **Late or failed:** the last answer this backend gave in this process, or
-  nothing if it has never answered. The rest of the gateway is not held up.
+- **Late or failed:** the last answer this backend gave in this process.
+  The rest of the gateway is not held up.
+
+The short deadline only applies once there is a remembered answer to fall
+back on. A backend that has never answered gets ``first_deadline`` (30s):
+cutting it off at 5s would serve nothing, not something older. Measured on
+the laptop (2026-10-19), stdio backends take up to 8s to cold-start
+(google_drive 6.8s, srs 7.7s, voice 8.1s), and boot warm-up visits them one
+at a time. So with a flat 5s, a client that listed in the first seconds after
+a gateway restart lost 36 tools until it listed again.
 
 A late call is not cancelled. It finishes in the background and refreshes
 the remembered answer, so the next list has it. A list that arrives while a
@@ -67,6 +75,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_LIST_DEADLINE = 5.0
+# For a backend with no remembered answer (module docstring). Above the 8s
+# stdio cold starts measured here, and above harness's default 15s MCP
+# connect timeout, which bounds this anyway for a harness client.
+FIRST_LIST_DEADLINE = 30.0
 
 
 def list_deadline_from_env() -> float | None:
@@ -106,11 +118,13 @@ class DeadlineProvider(Provider):
         name: str,
         deadline: float,
         remember: bool = True,
+        first_deadline: float = FIRST_LIST_DEADLINE,
     ) -> None:
         super().__init__()
         self._inner = inner
         self._name = name
         self._deadline = deadline
+        self._first_deadline = max(first_deadline, deadline)
         self._remember = remember
         self._slots: dict[str, _Slot] = {}
 
@@ -149,9 +163,9 @@ class DeadlineProvider(Provider):
                 slot.answer = result
             if elapsed > self._deadline:
                 logger.warning(
-                    "%s: late %s answer arrived after %.1fs (%d items)%s",
+                    "%s: slow %s answer, %.1fs (%d items)%s",
                     self._name, kind, elapsed, len(result),
-                    "; remembered for the next list" if self._remember else "",
+                    "; remembered for the next list" if self._remember and result else "",
                 )
             return result
 
@@ -166,16 +180,18 @@ class DeadlineProvider(Provider):
     async def _bounded(self, kind: str, fetch: Callable[[], Awaitable[Sequence[Any]]]) -> list[Any]:
         slot = self._slot(kind)
         task = self._start(kind, fetch)
+        fallback = slot.answer if self._remember else None
+        # The short deadline only when there is something to fall back on.
+        deadline = self._deadline if fallback is not None else self._first_deadline
         # asyncio.wait, not wait_for: on timeout the task keeps running, so
         # a slow backend's answer still lands and is remembered.
-        done, _ = await asyncio.wait({task}, timeout=self._deadline)
+        done, _ = await asyncio.wait({task}, timeout=deadline)
         if done and not task.cancelled() and task.exception() is None:
             return task.result()
-        fallback = slot.answer if self._remember else None
         logger.warning(
             "%s: %s %s; serving %s",
             self._name, kind,
-            f"exceeded {self._deadline:g}s" if not done else "failed",
+            f"exceeded {deadline:g}s" if not done else "failed",
             f"its last answer ({len(fallback)} items)" if fallback is not None else "nothing",
         )
         return list(fallback) if fallback is not None else []

@@ -55,7 +55,12 @@ class _Backend:
         return inner
 
 
-def _gateway(*backends: tuple[_Backend, bool], deadline: float = 0.2) -> FastMCP:
+def _gateway(
+    *backends: tuple[_Backend, bool],
+    deadline: float = 0.2,
+    first_deadline: float | None = None,
+) -> FastMCP:
+    """first_deadline defaults to deadline: most tests here are about the cut-off."""
     gw = FastMCP("gateway")
     for backend, remember in backends:
         gw.add_provider(
@@ -64,6 +69,7 @@ def _gateway(*backends: tuple[_Backend, bool], deadline: float = 0.2) -> FastMCP
                 name=backend.server.name,
                 deadline=deadline,
                 remember=remember,
+                first_deadline=deadline if first_deadline is None else first_deadline,
             )
         )
     return gw
@@ -121,6 +127,26 @@ async def test_never_answered_backend_serves_nothing_not_an_error():
     gw = _gateway((fast, True), (dead, True))
 
     assert (await _names(gw))[0] == {"define"}
+
+
+async def test_never_answered_backend_gets_the_first_deadline():
+    # Cutting off a backend with nothing remembered serves nothing, not
+    # something older. Stdio backends cold-start in up to 8s, so the first
+    # list after a gateway restart waits for them (up to first_deadline).
+    fast = _Backend("local", ["define"])
+    cold = _Backend("stdio", ["add_card"])
+    cold.delay = 0.5
+    gw = _gateway((fast, True), (cold, True), deadline=0.2, first_deadline=3.0)
+
+    names, elapsed = await _names(gw)
+    assert names == {"define", "add_card"}
+    assert 0.4 < elapsed < 2.0
+
+    # Once it has answered, slow means its last answer, at the short deadline.
+    cold.delay = 1.0
+    names, elapsed = await _names(gw)
+    assert names == {"define", "add_card"}
+    assert elapsed < 0.8
 
 
 async def test_one_call_in_flight_not_a_pile_of_retries():

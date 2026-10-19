@@ -6,6 +6,8 @@ fully-configured :class:`FastMCP` instance with all upstream servers mounted.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import logging
 import os
@@ -527,7 +529,34 @@ def create_gateway(
     FastMCP
         A fully-configured gateway ready to be served.
     """
-    from fastmcp.server import create_proxy
+    from fastmcp.server import create_proxy as fastmcp_create_proxy
+
+    # Every backend negotiates its own protocol era (mode="auto"), instead of
+    # copying the era of whichever client is asking.
+    #
+    # FastMCP 4's default for a proxy copies the front connection's era onto
+    # the backend leg. A front on the modern 2026-07-28 protocol (any
+    # fastmcp>=4 Client) then reaches every backend in the modern era, with no
+    # initialize handshake. A legacy-only backend (whatsapp-mcp,
+    # chrome-cdp-mcp) answers 404, the SDK reports that as -32601, and
+    # ProxyProvider._list_tools treats -32601 as "this server has no tools".
+    # So the backend silently vanished: whatsapp 0 tools instead of 4, chrome
+    # 0 instead of 12. A handshake-era front (the TypeScript SDK at
+    # 2025-11-25: harness, llm-multiplex) was unaffected, which is why this
+    # went unnoticed.
+    #
+    # "auto" is the fastmcp Client's own default: try the newest era, fall back
+    # to the handshake. What it gives up is era mirroring, i.e. pushing
+    # server-initiated sampling, elicitation or roots from a modern-capable
+    # backend through to a handshake front. Nothing behind this gateway uses
+    # those (grep over ~/prg, 2026-10-19). The identity proxies (identity.py)
+    # build their own ProxyClient, which already defaults to "auto".
+    #
+    # fastmcp 3.x has no eras and no `mode`; it always used the handshake.
+    if "mode" in inspect.signature(fastmcp_create_proxy).parameters:
+        create_proxy = functools.partial(fastmcp_create_proxy, mode="auto")
+    else:
+        create_proxy = fastmcp_create_proxy
 
     if servers is None:
         servers = load_servers()
