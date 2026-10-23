@@ -12,8 +12,10 @@ import os
 import secrets
 import sys
 import time
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from fastmcp import FastMCP
@@ -34,6 +36,31 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # OAuth provider
 # ---------------------------------------------------------------------------
+
+
+# Set for the duration of one authorize() whose client redirects to a host we
+# run ourselves (MCP_TRUSTED_REDIRECT_HOSTS); read by the consent switch.
+_trusted_authorize: ContextVar[bool] = ContextVar("trusted_authorize", default=False)
+
+
+def _trusted_redirect(redirect_uri: object) -> bool:
+    """Whether a client's redirect_uri is one of our own apps.
+
+    The consent page ("<client> wants to access the MCP server ...") guards
+    against a stranger's client getting a code minted for it with the
+    victim's Google grant (confused deputy). A client whose redirect_uri is
+    our own web app can't be that: the code lands with us, which checks its
+    own state. So for those -- and only those -- skip the page; every other
+    client still sees it.
+    """
+    hosts = {h.strip().lower() for h in os.environ.get("MCP_TRUSTED_REDIRECT_HOSTS", "").split(",") if h.strip()}
+    if not hosts:
+        return False
+    try:
+        u = urlparse(str(redirect_uri))
+    except Exception:  # noqa: BLE001
+        return False
+    return u.scheme == "https" and (u.hostname or "").lower() in hosts
 
 
 class StableRefreshGoogleProvider(GoogleProvider):
@@ -62,6 +89,30 @@ class StableRefreshGoogleProvider(GoogleProvider):
       - plans/fix-refresh-token-rotation-race.md  (Feb 2026, partial fix)
       - plans/refresh-token-stickiness-take-2.md  (May 2026, this work)
     """
+
+    # The consent switch, per request: fastmcp reads
+    # self._require_authorization_consent inside authorize(); this property
+    # answers False while a trusted authorize() is running (a ContextVar, so
+    # concurrent authorizations for other clients still see the real value).
+    @property
+    def _require_authorization_consent(self):  # type: ignore[override]
+        if _trusted_authorize.get():
+            return False
+        return self.__dict__.get("_require_authorization_consent_value", True)
+
+    @_require_authorization_consent.setter
+    def _require_authorization_consent(self, value) -> None:
+        self.__dict__["_require_authorization_consent_value"] = value
+
+    async def authorize(self, client, params):  # type: ignore[override]
+        token = _trusted_authorize.set(_trusted_redirect(getattr(params, "redirect_uri", None)))
+        try:
+            if _trusted_authorize.get():
+                logger.info("authorize: client %s redirects to a trusted host; no consent page",
+                            (getattr(client, "client_id", "") or "")[:8])
+            return await super().authorize(client, params)
+        finally:
+            _trusted_authorize.reset(token)
 
     async def get_client(self, client_id: str):  # type: ignore[override]
         """Log every DCR client lookup so we can see why /token returns 401.
