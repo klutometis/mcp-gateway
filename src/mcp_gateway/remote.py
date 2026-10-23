@@ -95,18 +95,11 @@ def main() -> None:
     # its client and token store (and names the store's directory). Unset,
     # fastmcp derives it from the Google client secret -- so rotating that
     # secret silently empties the store and voids every issued token
-    # (2026-10-23: every Tinker tester's Google connection). Set, it's used
-    # as-is (bytes; fastmcp applies no further derivation), and the Google
-    # secret can rotate on its own.
+    # (2026-10-23: every Tinker tester's Google connection). Set, fastmcp
+    # derives the key from this value instead (PBKDF2, as for any str key),
+    # and the Google secret can rotate on its own.
     jwt_key = os.environ.get("MCP_JWT_SIGNING_KEY", "").strip()
-    # A temporary bridge: the key fastmcp used to derive from the previous
-    # client secret, so a store and tokens issued under it keep working
-    # until they're migrated to MCP_JWT_SIGNING_KEY. Meant to be removed.
-    bridge = os.environ.get("MCP_JWT_SIGNING_KEY_BRIDGE", "").strip()
-    if bridge:
-        print("JWT signing key: BRIDGE (previous derived key; temporary, remove once migrated)")
-        jwt_key = bridge
-    elif jwt_key:
+    if jwt_key:
         print("JWT signing key: MCP_JWT_SIGNING_KEY")
     auth = StableRefreshGoogleProvider(
         client_id=client_id,
@@ -117,7 +110,7 @@ def main() -> None:
             "prompt": "consent",
             "scope": scope,
         },
-        **({"jwt_signing_key": jwt_key.encode()} if jwt_key else {}),
+        **({"jwt_signing_key": jwt_key} if jwt_key else {}),
     )
 
     print(f"Starting MCP Gateway with Google OAuth")
