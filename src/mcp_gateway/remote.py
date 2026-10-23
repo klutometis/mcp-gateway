@@ -95,9 +95,10 @@ def main() -> None:
     # its client and token store (and names the store's directory). Unset,
     # fastmcp derives it from the Google client secret -- so rotating that
     # secret silently empties the store and voids every issued token
-    # (2026-10-23: every Tinker tester's Google connection). Set, fastmcp
-    # derives the key from this value instead (PBKDF2, as for any str key),
-    # and the Google secret can rotate on its own.
+    # (2026-10-23: every Tinker tester's Google connection). Set, it's used
+    # as-is (bytes; fastmcp applies no further derivation), and the Google
+    # secret can rotate on its own. The 2026-10-23 migration re-keyed the
+    # store and the issued tokens to exactly these bytes.
     jwt_key = os.environ.get("MCP_JWT_SIGNING_KEY", "").strip()
     if jwt_key:
         print("JWT signing key: MCP_JWT_SIGNING_KEY")
@@ -110,7 +111,7 @@ def main() -> None:
             "prompt": "consent",
             "scope": scope,
         },
-        **({"jwt_signing_key": jwt_key} if jwt_key else {}),
+        **({"jwt_signing_key": jwt_key.encode()} if jwt_key else {}),
     )
 
     print(f"Starting MCP Gateway with Google OAuth")
