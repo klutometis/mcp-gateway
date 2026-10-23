@@ -99,6 +99,15 @@ def main() -> None:
     # as-is (bytes; fastmcp applies no further derivation), and the Google
     # secret can rotate on its own.
     jwt_key = os.environ.get("MCP_JWT_SIGNING_KEY", "").strip()
+    # A temporary bridge: the key fastmcp used to derive from the previous
+    # client secret, so a store and tokens issued under it keep working
+    # until they're migrated to MCP_JWT_SIGNING_KEY. Meant to be removed.
+    bridge = os.environ.get("MCP_JWT_SIGNING_KEY_BRIDGE", "").strip()
+    if bridge:
+        print("JWT signing key: BRIDGE (previous derived key; temporary, remove once migrated)")
+        jwt_key = bridge
+    elif jwt_key:
+        print("JWT signing key: MCP_JWT_SIGNING_KEY")
     auth = StableRefreshGoogleProvider(
         client_id=client_id,
         client_secret=client_secret,
