@@ -91,6 +91,14 @@ def main() -> None:
     # fronts an upstream that forwards the caller's token to Google APIs.
     # Defaults to the minimal identity set.
     scope = os.environ.get("MCP_OIDC_SCOPES", "openid email").strip() or "openid email"
+    # The key that signs this gateway's JWTs and, derived from it, encrypts
+    # its client and token store (and names the store's directory). Unset,
+    # fastmcp derives it from the Google client secret -- so rotating that
+    # secret silently empties the store and voids every issued token
+    # (2026-10-23: every Tinker tester's Google connection). Set, it's used
+    # as-is (bytes; fastmcp applies no further derivation), and the Google
+    # secret can rotate on its own.
+    jwt_key = os.environ.get("MCP_JWT_SIGNING_KEY", "").strip()
     auth = StableRefreshGoogleProvider(
         client_id=client_id,
         client_secret=client_secret,
@@ -100,6 +108,7 @@ def main() -> None:
             "prompt": "consent",
             "scope": scope,
         },
+        **({"jwt_signing_key": jwt_key.encode()} if jwt_key else {}),
     )
 
     print(f"Starting MCP Gateway with Google OAuth")
