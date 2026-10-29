@@ -602,6 +602,32 @@ def create_gateway(
     if _sum_mw is not None:
         gateway.add_middleware(_sum_mw)
 
+    # Offload large binary tool results (attachments, media, thumbnails) to
+    # object storage and hand the model a signed capability URL instead of
+    # base64. Off unless MCP_ATTACHMENT_OFFLOAD=1; rules and thresholds come
+    # from MCP_ATTACHMENT_CONFIG. See src/mcp_gateway/attachments/ and
+    # plans/messaging-attachments-r2.md.
+    #
+    # ORDER, again load-bearing, and again the reverse of reading order:
+    # added last means it runs FIRST on the way out, so it sees the
+    # upstream's original bytes and stores those (full resolution in R2,
+    # which is what view_image then downsamples from). Whatever it leaves
+    # inline — small images — still passes through the downscale middleware
+    # on the way out, which is the right division of labour: this one
+    # decides what the model gets at all, that one caps what remains.
+    from mcp_gateway.attachments import (
+        AttachmentOffloadMiddleware,
+        AttachmentService,
+        register_artifact_route,
+        register_attachment_tools,
+    )
+
+    _attachments = AttachmentService.from_env()
+    if _attachments is not None:
+        gateway.add_middleware(AttachmentOffloadMiddleware(_attachments))
+        register_attachment_tools(gateway, _attachments)
+        register_artifact_route(gateway, _attachments)
+
     # Track proxies needing warm-up on startup. FastMCP's stdio transport is
     # lazy: subprocesses don't spawn until first tool call. For wss-shim-backed
     # entries that's a chicken-and-egg — the bridge can't dial in until the

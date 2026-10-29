@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Servers file for tests/manual/attachment_e2e.py. One stdio child: the",
+    "stub attachment server, which returns big binary payloads in the four",
+    "shapes real MCPs use. ${MCP_GATEWAY_REPO} must point at this checkout.",
+    "Layer it after a real servers.json (MCP_SERVERS_FILE is PATH-style) to",
+    "drive a real upstream through the same gateway."
+  ],
+  "stub": {
+    "transport": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--project",
+      "${MCP_GATEWAY_REPO}",
+      "python",
+      "${MCP_GATEWAY_REPO}/tests/manual/stub_attachment_server.py"
+    ],
+    "tools": "*"
+  }
+}

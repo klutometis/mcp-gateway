@@ -18,7 +18,13 @@ auth), rather than forked.
 - **Multi-instance routing** — one logical server, N backends keyed by an
   injected `account`/`host`/`instance` param (e.g. personal+work, or
   laptop+desktop+vm). Enum-in-schema, fail-at-call-time error enrichment.
-- **Middleware** — e.g. image downscaling on outbound content blocks.
+- **Middleware** — e.g. image downscaling on outbound content blocks, and
+  **attachment offload**: tool results carrying bytes (WhatsApp media,
+  LinkedIn attachments, iMessage attachments, Roblox thumbnails) are
+  uploaded to Cloudflare R2 and replaced with a short-lived signed URL,
+  so base64 never reaches the context window. Paired gateway-native
+  tools `view_image` and `ask_about_attachment` read the bytes back.
+  See [`notes/attachment-offload.md`](notes/attachment-offload.md).
 - **Pluggable auth** — single-user (bearer/OAuth) today; a multi-tenant
   provider (per-user identity forwarded to each upstream) is the next
   milestone.
