@@ -409,6 +409,17 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
                 'from_claim': fi.get('from_claim', 'email'),
                 'sanitize': fi.get('sanitize'),
             }
+            # as=signed: a per-call assertion for a per-person wss-shim
+            # sidecar (plan 057). The shim matches the raw address against
+            # each device token, so a sanitizer would make nothing match.
+            if entry['forward_identity']['as'] == 'signed':
+                if fi.get('sanitize'):
+                    raise ValueError(
+                        f"server '{name}': forward_identity as=signed carries the "
+                        "raw address; drop 'sanitize'")
+                entry['forward_identity']['audience'] = fi.get('audience', name)
+                entry['forward_identity']['key_env'] = fi.get(
+                    'key_env', 'WSS_SHIM_ASSERTION_KEY')
         # Per-request token forwarding: forward the caller's own Authorization
         # (e.g. a Google access token) to a token-consumer upstream.
         if cfg.get('forward_token'):
@@ -891,12 +902,22 @@ def _build_single_instance(
             from_claim=fi.get("from_claim", "email"),
             sanitize=fi.get("sanitize"),
         )
+        signing_key = None
+        if fi.get("as") == "signed":
+            key_env = fi.get("key_env", "WSS_SHIM_ASSERTION_KEY")
+            signing_key = os.environ.get(key_env, "").encode() or None
+            if signing_key is None:
+                raise ValueError(
+                    f"server '{name}': forward_identity as=signed needs ${key_env}, "
+                    "the key its wss-shim sidecar verifies caller identities with")
         proxy = make_identity_forwarding_proxy(
             _expand_env(server_config["url"]),
             resolver,
             carrier=fi.get("as", "baggage"),
             baggage_key=fi.get("key", "userId"),
             header_name=fi.get("name", "X-Spark-Group-Id"),
+            signing_key=signing_key,
+            audience=fi.get("audience", name),
             base_headers=_expand_headers(server_config.get("headers", {})),
             name=f"Proxy-{name}",
         )

@@ -42,9 +42,12 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
+
+import jwt
 
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.server.dependencies import get_access_token, get_http_headers
@@ -55,6 +58,12 @@ _log = logging.getLogger("mcp_gateway.identity")
 BAGGAGE_HEADER = "baggage"
 DEFAULT_BAGGAGE_KEY = "userId"
 DEFAULT_IDENTITY_HEADER = "X-Spark-Group-Id"
+
+# carrier="signed": the contract with wss-shim's identity.py (plan 057).
+# Header, claims, algorithm and lifetime must match wss_shim.identity.
+SIGNED_IDENTITY_HEADER = "X-Wss-Shim-Identity"
+SIGNED_IDENTITY_LIFETIME_S = 60
+SIGNED_IDENTITY_MIN_KEY = 32
 
 # A resolver returns the caller's identity (e.g. group_id) for the current
 # request, or None if unauthenticated / not resolvable.
@@ -164,6 +173,38 @@ def build_header_identity(
     return headers
 
 
+def build_signed_identity(
+    identity: str | None,
+    *,
+    key: bytes,
+    audience: str,
+    base_headers: dict[str, str] | None = None,
+    now: float | None = None,
+) -> dict[str, str]:
+    """Merge ``identity`` into a copy of ``base_headers`` as a signed assertion.
+
+    For upstreams that serve many people and must not take a bare header's
+    word for who is calling — wss-shim sidecars in per-person mode, whose
+    /mcp may be published behind a shared static bearer. The assertion is
+    an HS256 JWT ``{email, aud, iat, exp}``, 60 s, minted fresh per call;
+    ``audience`` is the sidecar's name, so one sidecar's assertion is
+    useless at another. ``identity`` must be the raw address (no sanitizer):
+    the shim matches it against the addresses in each device token.
+    Falsy identity omits the header.
+    """
+    headers = dict(base_headers or {})
+    if identity:
+        iat = int(time.time() if now is None else now)
+        headers[SIGNED_IDENTITY_HEADER] = jwt.encode(
+            {"email": identity.strip().lower(), "aud": audience,
+             "iat": iat, "exp": iat + SIGNED_IDENTITY_LIFETIME_S},
+            key, algorithm="HS256",
+        )
+    else:
+        headers.pop(SIGNED_IDENTITY_HEADER, None)
+    return headers
+
+
 # A stamp merges a resolved identity into a base header dict.
 HeaderStamp = Callable[["str | None", "dict[str, str] | None"], "dict[str, str]"]
 
@@ -212,6 +253,8 @@ def make_identity_forwarding_proxy(
     carrier: str = "baggage",
     baggage_key: str = DEFAULT_BAGGAGE_KEY,
     header_name: str = DEFAULT_IDENTITY_HEADER,
+    signing_key: bytes | None = None,
+    audience: str | None = None,
     base_headers: dict[str, str] | None = None,
     name: str | None = None,
     proxy_client_kwargs: dict[str, Any] | None = None,
@@ -223,6 +266,8 @@ def make_identity_forwarding_proxy(
       - ``"header"``: a plain ``<header_name>: <id>`` (e.g. the existing
         tools-server's ``X-Spark-Group-Id``) — for coexistence with
         upstreams that predate baggage.
+      - ``"signed"``: ``X-Wss-Shim-Identity: <HS256 JWT>``, signed with
+        ``signing_key`` for ``audience`` (see build_signed_identity).
     """
     if carrier == "baggage":
         def stamp(ident: str | None, base: dict[str, str] | None) -> dict[str, str]:
@@ -230,8 +275,20 @@ def make_identity_forwarding_proxy(
     elif carrier == "header":
         def stamp(ident: str | None, base: dict[str, str] | None) -> dict[str, str]:
             return build_header_identity(ident, header_name=header_name, base_headers=base)
+    elif carrier == "signed":
+        if not signing_key or len(signing_key) < SIGNED_IDENTITY_MIN_KEY:
+            raise ValueError(
+                f"carrier='signed' needs a signing key of at least "
+                f"{SIGNED_IDENTITY_MIN_KEY} bytes")
+        if not audience:
+            raise ValueError("carrier='signed' needs an audience (the sidecar's name)")
+
+        def stamp(ident: str | None, base: dict[str, str] | None) -> dict[str, str]:
+            return build_signed_identity(ident, key=signing_key, audience=audience,
+                                         base_headers=base)
     else:
-        raise ValueError(f"carrier must be 'baggage' or 'header', got {carrier!r}")
+        raise ValueError(
+            f"carrier must be 'baggage', 'header' or 'signed', got {carrier!r}")
 
     factory = identity_forwarding_client_factory(
         url,

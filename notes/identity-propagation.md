@@ -94,3 +94,26 @@ spoofable header is no longer acceptable.
 - OpenTelemetry Baggage / context propagation
 - RFC 6648 (deprecating new `X-` headers)
 - MCP auth = OAuth 2.1 (the Option-A path, for untrusted boundaries)
+
+## Addendum 2026-11-01: `as: signed`, for upstreams that serve many people
+
+Baggage is a claim the upstream takes on trust, which is fine when the
+upstream is reachable only through the gateway. Per-person wss-shim
+sidecars (mneme plan 057) are not always: `mcp.danenberg.ai` publishes some
+sidecar `/mcp` routes behind one shared static bearer, and a sidecar that
+routes each call to the *caller's own* device must not let a bearer-holder
+name the caller. So a third carrier:
+
+```json
+"forward_identity": { "as": "signed", "audience": "chrome", "key_env": "WSS_SHIM_ASSERTION_KEY" }
+```
+
+Per call, the gateway sends `X-Wss-Shim-Identity: <HS256 JWT {email, aud,
+iat, exp}>`, 60 s, keyed with `$WSS_SHIM_ASSERTION_KEY`, audience defaulting
+to the server entry's name. The address is raw (no `sanitize`; the loader
+refuses one) because the shim matches it against the addresses in each
+device token. HS256 is enough on this hop because gateway and sidecars run
+in one container: the entrypoint generates the key at boot and hands it to
+both, so it is never stored or copied. The gateway refuses to build a
+signed server without its key. Contract and end-to-end check:
+`tests/manual/wss_shim_signed_identity_e2e.py`.

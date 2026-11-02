@@ -180,3 +180,106 @@ def test_load_servers_parses_forward_identity(tmp_path):
         "from_claim": "email",
         "sanitize": "safe",
     }
+
+
+# --- signed carrier (per-person wss-shim sidecars, plan 057) ---------------
+
+import time as _time
+
+import jwt as _jwt
+import pytest as _pytest
+
+from mcp_gateway.gateway import _build_single_instance
+from mcp_gateway.identity import (
+    SIGNED_IDENTITY_HEADER,
+    SIGNED_IDENTITY_LIFETIME_S,
+    build_signed_identity,
+)
+
+_KEY = b"k" * 40
+
+
+def _assertion(headers: dict) -> dict:
+    return _jwt.decode(headers[SIGNED_IDENTITY_HEADER], _KEY, algorithms=["HS256"],
+                       audience="chrome")
+
+
+def test_signed_identity_matches_the_shim_contract():
+    h = build_signed_identity("Peter@Danenberg.AI", key=_KEY, audience="chrome")
+    claims = _assertion(h)
+    assert claims["email"] == "peter@danenberg.ai"
+    assert claims["aud"] == "chrome"
+    assert claims["exp"] - claims["iat"] == SIGNED_IDENTITY_LIFETIME_S == 60
+    assert abs(claims["iat"] - _time.time()) < 5
+    assert _jwt.get_unverified_header(h[SIGNED_IDENTITY_HEADER])["alg"] == "HS256"
+
+
+def test_signed_identity_is_useless_elsewhere():
+    token = build_signed_identity("a@x.com", key=_KEY, audience="chrome")[SIGNED_IDENTITY_HEADER]
+    with _pytest.raises(_jwt.InvalidAudienceError):
+        _jwt.decode(token, _KEY, algorithms=["HS256"], audience="tmux")
+    with _pytest.raises(_jwt.InvalidSignatureError):
+        _jwt.decode(token, b"x" * 40, algorithms=["HS256"], audience="chrome")
+
+
+def test_signed_identity_omits_and_strips_when_unauthenticated():
+    stale = {SIGNED_IDENTITY_HEADER: "from-a-previous-caller", "x-other": "kept"}
+    assert build_signed_identity(None, key=_KEY, audience="chrome", base_headers=stale) == {
+        "x-other": "kept"}
+
+
+def test_factory_signs_whoever_is_calling_now():
+    current = {"id": None}
+    stamp = lambda ident, base: build_signed_identity(ident, key=_KEY, audience="chrome",
+                                                      base_headers=base)
+    factory = identity_forwarding_client_factory("http://chrome.local/mcp",
+                                                 lambda: current["id"], stamp=stamp)
+    current["id"] = "alice@example.com"
+    a = dict(factory().transport.headers)
+    current["id"] = "bob@example.com"
+    b = dict(factory().transport.headers)
+    assert _assertion(a)["email"] == "alice@example.com"
+    assert _assertion(b)["email"] == "bob@example.com"
+
+
+def test_signed_carrier_refuses_to_build_half_configured():
+    url, who = "http://chrome.local/mcp", lambda: "a@x.com"
+    assert isinstance(make_identity_forwarding_proxy(
+        url, who, carrier="signed", signing_key=_KEY, audience="chrome"), FastMCPProxy)
+    for kwargs, why in [({"audience": "chrome"}, "signing key"),
+                        ({"signing_key": b"short", "audience": "chrome"}, "signing key"),
+                        ({"signing_key": _KEY}, "audience")]:
+        with _pytest.raises(ValueError, match=why):
+            make_identity_forwarding_proxy(url, who, carrier="signed", **kwargs)
+
+
+def _servers(tmp_path, fi: dict) -> dict:
+    p = tmp_path / "servers.json"
+    p.write_text(json.dumps({"chrome": {"transport": "streamable-http",
+                                        "url": "http://127.0.0.1:8008/mcp",
+                                        "forward_identity": fi, "tools": "*"}}))
+    return load_servers(str(p))
+
+
+def test_load_servers_parses_signed_with_defaults(tmp_path):
+    fi = _servers(tmp_path, {"as": "signed"})["chrome"]["forward_identity"]
+    assert fi["as"] == "signed"
+    assert fi["audience"] == "chrome"                 # the entry's own name
+    assert fi["key_env"] == "WSS_SHIM_ASSERTION_KEY"
+    assert fi["from_claim"] == "email" and fi["sanitize"] is None
+
+
+def test_load_servers_refuses_signed_with_a_sanitizer(tmp_path):
+    with _pytest.raises(ValueError, match="sanitize"):
+        _servers(tmp_path, {"as": "signed", "sanitize": "safe"})
+
+
+def test_building_a_signed_server_needs_its_key(tmp_path, monkeypatch):
+    servers = _servers(tmp_path, {"as": "signed"})
+    build = lambda: _build_single_instance(name="chrome", server_config=servers["chrome"],
+                                           tool_configs="*", create_proxy=None)
+    monkeypatch.delenv("WSS_SHIM_ASSERTION_KEY", raising=False)
+    with _pytest.raises(ValueError, match="WSS_SHIM_ASSERTION_KEY"):
+        build()
+    monkeypatch.setenv("WSS_SHIM_ASSERTION_KEY", "z" * 40)
+    assert isinstance(build(), FastMCPProxy)
