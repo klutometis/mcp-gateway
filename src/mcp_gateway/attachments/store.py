@@ -4,18 +4,27 @@ Keys are **content-addressed** (``attachments/<sha256><ext>``), which is
 the plan's dedup story: the same bytes fetched twice are uploaded once
 and get the same URL.
 
-Why the Cloudflare REST object API rather than R2's S3 endpoint: the
-only thing we would gain from S3 is presigned URLs, and
-``cap.py`` explains why we don't want those. Going over the REST API
-means the only credential involved is an account-scoped Cloudflare API
-token read from the operator's environment — no S3 access-key pair to
-mint, store and rotate, and no new SDK (we already depend on httpx).
+Two ways to talk to R2, same object layout either way:
+
+* **S3 API (SigV4)** with an access-key pair, chosen when one is configured.
+  This is the one to use: R2's *bucket-scoped* tokens ("Object Read & Write"
+  on one bucket, made under R2 > API Tokens) only work over S3. The
+  Cloudflare REST object API answers them 403 even on their own bucket --
+  measured 2026-11-11 -- so a REST-only gateway forces an account-wide
+  token that can also write every other bucket. Signing is hand-rolled
+  (~40 lines, below) rather than a boto3 dependency.
+* **Cloudflare REST object API** with a bearer token, the fallback when no
+  key pair is set. Needs an account-level R2 token.
+
+We never use S3 *presigned* URLs; ``cap.py`` explains why.
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -30,7 +39,15 @@ from mcp_gateway.attachments.config import StorageConfig
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Artifact", "ArtifactStore", "FileStore", "R2Store", "StoreError", "build_store"]
+__all__ = [
+    "Artifact",
+    "ArtifactStore",
+    "FileStore",
+    "R2Store",
+    "StoreError",
+    "build_store",
+    "sigv4_headers",
+]
 
 _API = "https://api.cloudflare.com/client/v4"
 
@@ -121,34 +138,82 @@ class FileStore:
 
 
 class R2Store:
-    """Cloudflare R2 over the account REST object API."""
+    """Cloudflare R2, over S3 (SigV4) when given a key pair, else the REST API."""
 
     def __init__(
         self,
         *,
         account_id: str,
-        token: str,
         bucket: str,
+        token: str = "",
+        access_key_id: str = "",
+        secret_access_key: str = "",
         timeout: float = 60.0,
         api_base: str = _API,
+        s3_endpoint: str | None = None,
     ) -> None:
-        if not account_id or not token:
-            raise StoreError("R2 store needs an account id and an API token")
+        if not account_id:
+            raise StoreError("R2 store needs an account id")
+        self.s3 = bool(access_key_id and secret_access_key)
+        if not self.s3 and not token:
+            raise StoreError(
+                "R2 store needs an S3 access-key pair or a Cloudflare API token"
+            )
         self.account_id = account_id
         self.token = token
+        self.access_key_id = access_key_id
+        self.secret_access_key = secret_access_key
         self.bucket = bucket
         self.timeout = timeout
         self.api_base = api_base
+        self.s3_endpoint = (
+            s3_endpoint or f"https://{account_id}.r2.cloudflarestorage.com"
+        ).rstrip("/")
+
+    # -- addressing and auth -------------------------------------------
 
     def _url(self, key: str) -> str:
+        if self.s3:
+            return f"{self.s3_endpoint}/{self.bucket}/{quote(key, safe='/')}"
         return (
             f"{self.api_base}/accounts/{self.account_id}/r2/buckets/"
             f"{self.bucket}/objects/{quote(key, safe='/')}"
         )
 
-    @property
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.token}"}
+    def _headers(
+        self, method: str, key: str, body: bytes = b"", ctype: str | None = None
+    ) -> dict[str, str]:
+        headers = {"Content-Type": ctype} if ctype else {}
+        if not self.s3:
+            return {**headers, "Authorization": f"Bearer {self.token}"}
+        return {
+            **headers,
+            **sigv4_headers(
+                method=method,
+                url=self._url(key),
+                body=body,
+                access_key_id=self.access_key_id,
+                secret_access_key=self.secret_access_key,
+                extra=headers,
+            ),
+        }
+
+    async def _send(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        key: str,
+        body: bytes = b"",
+        ctype: str | None = None,
+    ) -> httpx.Response:
+        return await client.request(
+            method,
+            self._url(key),
+            content=body if method == "PUT" else None,
+            headers=self._headers(method, key, body, ctype),
+        )
+
+    # -- the store protocol ----------------------------------------------
 
     async def put(self, key: str, data: bytes, *, mime: str, filename: str) -> None:
         meta = json.dumps(
@@ -159,17 +224,13 @@ class R2Store:
                 (key, data, mime),
                 (_meta_key(key), meta, "application/json"),
             ):
-                r = await client.put(
-                    self._url(k),
-                    content=body,
-                    headers={**self._headers, "Content-Type": ctype},
-                )
+                r = await self._send(client, "PUT", k, body, ctype)
                 if r.status_code >= 300:
                     raise StoreError(f"R2 PUT {k} -> {r.status_code}: {r.text[:300]}")
 
     async def get(self, key: str) -> Artifact:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.get(self._url(key), headers=self._headers)
+            r = await self._send(client, "GET", key)
             if r.status_code == 404:
                 raise StoreError(f"no such artifact: {key}")
             if r.status_code >= 300:
@@ -177,7 +238,7 @@ class R2Store:
             data = r.content
             mime = r.headers.get("content-type", "application/octet-stream")
             filename = Path(key).name
-            m = await client.get(self._url(_meta_key(key)), headers=self._headers)
+            m = await self._send(client, "GET", _meta_key(key))
             if m.status_code < 300:
                 try:
                     meta = m.json()
@@ -189,13 +250,74 @@ class R2Store:
 
     async def exists(self, key: str) -> bool:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.head(self._url(key), headers=self._headers)
+            r = await self._send(client, "HEAD", key)
             if r.status_code == 405:  # HEAD unsupported -> fall back to GET
-                r = await client.get(self._url(key), headers=self._headers)
+                r = await self._send(client, "GET", key)
             return r.status_code < 300
 
     def describe(self) -> str:
-        return f"r2:{self.bucket}"
+        return f"r2:{self.bucket} ({'s3' if self.s3 else 'rest'})"
+
+
+def sigv4_headers(
+    *,
+    method: str,
+    url: str,
+    body: bytes,
+    access_key_id: str,
+    secret_access_key: str,
+    extra: dict[str, str] | None = None,
+    region: str = "auto",
+    service: str = "s3",
+    now: _dt.datetime | None = None,
+) -> dict[str, str]:
+    """AWS Signature Version 4 headers for one request (R2 uses region ``auto``).
+
+    Only what this store needs: no query string, payload hashed in full.
+    ``extra`` headers (Content-Type) are signed too.
+    """
+    u = httpx.URL(url)
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    day = now.strftime("%Y%m%d")
+    payload_hash = hashlib.sha256(body).hexdigest()
+    signed = {
+        "host": u.netloc.decode() if isinstance(u.netloc, bytes) else str(u.netloc),
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+        **{k.lower(): v.strip() for k, v in (extra or {}).items()},
+    }
+    names = sorted(signed)
+    canonical = "\n".join(
+        [
+            method,
+            u.raw_path.decode().split("?", 1)[0] or "/",
+            "",  # no query string
+            "".join(f"{n}:{signed[n]}\n" for n in names),
+            ";".join(names),
+            payload_hash,
+        ]
+    )
+    scope = f"{day}/{region}/{service}/aws4_request"
+    to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()]
+    )
+
+    def _h(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k = _h(("AWS4" + secret_access_key).encode(), day)
+    for part in (region, service, "aws4_request"):
+        k = _h(k, part)
+    sig = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+    return {
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+        "Authorization": (
+            f"AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, "
+            f"SignedHeaders={';'.join(names)}, Signature={sig}"
+        ),
+    }
 
 
 def build_store(cfg: StorageConfig, env: dict[str, str] | None = None) -> ArtifactStore:
@@ -209,8 +331,10 @@ def build_store(cfg: StorageConfig, env: dict[str, str] | None = None) -> Artifa
     if cfg.backend == "r2":
         return R2Store(
             account_id=env.get(cfg.account_id_env, ""),
-            token=env.get(cfg.token_env, ""),
             bucket=cfg.bucket,
+            token=env.get(cfg.token_env, ""),
+            access_key_id=env.get(cfg.access_key_id_env, ""),
+            secret_access_key=env.get(cfg.secret_access_key_env, ""),
         )
     raise StoreError(f"unknown attachment storage backend: {cfg.backend!r}")
 

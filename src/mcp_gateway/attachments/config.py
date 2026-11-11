@@ -116,9 +116,12 @@ class StorageConfig:
     backend: str = "r2"  # "r2" | "file"
     bucket: str = "mcp-attachments"
     prefix: str = "attachments/"
-    # R2 (Cloudflare REST object API; no S3 keys needed)
+    # R2. With an S3 key pair (preferred: works with a bucket-scoped token)
+    # the store speaks S3/SigV4; otherwise the REST API with token_env.
     account_id_env: str = "CLOUDFLARE_ACCOUNT_ID"
     token_env: str = "MCP_ATTACHMENT_R2_TOKEN"
+    access_key_id_env: str = "MCP_ATTACHMENT_R2_ACCESS_KEY_ID"
+    secret_access_key_env: str = "MCP_ATTACHMENT_R2_SECRET_ACCESS_KEY"
     # file backend
     directory: str | None = None
 
@@ -230,6 +233,10 @@ def load_config(
         prefix=env.get("MCP_ATTACHMENT_PREFIX", s.get("prefix", "attachments/")),
         account_id_env=s.get("account_id_env", "CLOUDFLARE_ACCOUNT_ID"),
         token_env=s.get("token_env", "MCP_ATTACHMENT_R2_TOKEN"),
+        access_key_id_env=s.get("access_key_id_env", "MCP_ATTACHMENT_R2_ACCESS_KEY_ID"),
+        secret_access_key_env=s.get(
+            "secret_access_key_env", "MCP_ATTACHMENT_R2_SECRET_ACCESS_KEY"
+        ),
         directory=env.get("MCP_ATTACHMENT_DIR", s.get("directory")),
     )
 
