@@ -384,11 +384,15 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
         if raw_tools == '*':
             tools = '*'
         else:
+            # Pass only the keys the map sets. ToolTransformConfig.apply
+            # forwards every *set* field, so description=None here would
+            # erase the upstream description rather than keep it -- which
+            # is how every renamed play_* tool on mcp.danenbros.com shipped
+            # with none (2026-11-10). Absent means "keep upstream's".
             tools = {
                 upstream: ToolTransformConfig(
                     name=tc['name'],
-                    title=tc.get('title'),
-                    description=tc.get('description'),
+                    **{k: tc[k] for k in ('title', 'description') if k in tc},
                 )
                 for upstream, tc in raw_tools.items()
             }

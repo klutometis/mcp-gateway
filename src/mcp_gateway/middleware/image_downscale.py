@@ -162,10 +162,13 @@ class ImageDownscaleMiddleware(Middleware):
             out_fmt,
             len(new_bytes),
         )
+        # Field names, not wire aliases: mcp 2.x calls it ``mime_type``, and
+        # model_copy(update=) skips aliasing, so "mimeType" here would set a
+        # stray attribute and ship WebP bytes still labelled image/jpeg.
         return block.model_copy(
             update={
                 "data": base64.b64encode(new_bytes).decode("ascii"),
-                "mimeType": _MIME[out_fmt],
+                "mime_type": _MIME[out_fmt],
             }
         )
 
