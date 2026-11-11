@@ -67,6 +67,25 @@ full resolution in R2, which is what `view_image` downsamples from —
 while whatever it leaves inline still passes through the downscaler.
 This one decides what the model gets at all; that one caps what remains.
 
+## Tools that are only safe with offload: `"requires"`
+
+A tool whose *only* output is bytes (WhatsApp's `download_media`) is a
+liability on a host without offload, and `deploy/common/servers.json` is
+shared between hosts that have it and hosts that do not. So a tool-map entry
+may say
+
+```json
+"download_media": {"name": "whatsapp_download_media", "requires": "attachment_offload"}
+```
+
+and `load_servers` drops it unless `load_config().enabled` — the same
+predicate `create_gateway` uses to install the middleware, so the tool and
+the middleware cannot disagree. An unknown capability hides the tool (fail
+closed). Tested in `tests/test_tool_requires.py`. Tools that return bytes
+*sometimes* (LinkedIn, iMessage, Roblox thumbnails) were exposed before
+offload existed and are not gated; gating them would change hosts that
+never opted in.
+
 ## Configuration
 
 Off unless `MCP_ATTACHMENT_OFFLOAD=1`. Rules and thresholds come from

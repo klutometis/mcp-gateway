@@ -323,6 +323,44 @@ class StableRefreshGoogleProvider(GoogleProvider):
 # minimal and the names clean (no prefixes like zep_, firecrawl_, etc.).
 # See plans/tool-subsetting-renaming.md for rationale.
 
+def _capability_live(capability: str) -> bool:
+    """Is ``capability`` switched on in this process's environment?
+
+    Known capabilities:
+
+    ``attachment_offload``
+        The response-side offload middleware will be installed, by the very
+        predicate ``create_gateway`` uses (``load_config().enabled``). A tool
+        that returns raw bytes -- WhatsApp's ``download_media`` -- requires
+        it: without offload, one photo is ~20-350k tokens of base64 and kills
+        the chat. Gating on the same predicate means the tool and the
+        middleware cannot disagree about whether offload is on.
+
+    Anything else is unknown and therefore *not* live: a typo or a
+    capability from a newer gateway hides the tool rather than exposing it.
+    """
+    if capability == 'attachment_offload':
+        from mcp_gateway.attachments.config import load_config
+
+        return load_config().enabled
+    logger.warning("servers.json: unknown capability %r in 'requires'; hiding the tool", capability)
+    return False
+
+
+def _unmet_requirements(requires: Any, memo: dict[str, bool]) -> list[str]:
+    """The capabilities in a tool's ``requires`` that are not live here."""
+    if not requires:
+        return []
+    wanted = [requires] if isinstance(requires, str) else list(requires)
+    unmet = []
+    for cap in wanted:
+        if cap not in memo:
+            memo[cap] = _capability_live(cap)
+        if not memo[cap]:
+            unmet.append(cap)
+    return unmet
+
+
 def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
     """Load server configuration from a JSON file.
 
@@ -368,6 +406,7 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
             raw.update(json.load(f))
 
     servers: dict[str, dict[str, Any]] = {}
+    _capabilities: dict[str, bool] = {}  # memo for _unmet_requirements
     for name, cfg in raw.items():
         # JSON has no comments, so a top-level "_..." key is how a
         # servers.json explains itself -- notably why a curated file
@@ -389,13 +428,24 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
             # erase the upstream description rather than keep it -- which
             # is how every renamed play_* tool on mcp.danenbros.com shipped
             # with none (2026-11-10). Absent means "keep upstream's".
-            tools = {
-                upstream: ToolTransformConfig(
+            #
+            # A tool may also say "requires": "<capability>" (or a list). It
+            # is exposed only if every capability is live on this host, so a
+            # shared servers.json can list a tool that is safe on one host and
+            # dangerous on another. See _unmet_requirements.
+            tools = {}
+            for upstream, tc in raw_tools.items():
+                unmet = _unmet_requirements(tc.get('requires'), _capabilities)
+                if unmet:
+                    logger.info(
+                        "server %r: hiding tool %r (%s); requires %s, not on here",
+                        name, upstream, tc['name'], ', '.join(unmet),
+                    )
+                    continue
+                tools[upstream] = ToolTransformConfig(
                     name=tc['name'],
                     **{k: tc[k] for k in ('title', 'description') if k in tc},
                 )
-                for upstream, tc in raw_tools.items()
-            }
         entry: dict[str, Any] = {
             'transport': transport,
             'tools': tools,
