@@ -100,7 +100,9 @@ built-in defaults cover `*.download_media`, `*.fetch_attachment`,
 | `MCP_ATTACHMENT_CONFIG` | — | rules file |
 | `MCP_ATTACHMENT_BACKEND` | `r2` | or `file` |
 | `MCP_ATTACHMENT_BUCKET` | `mcp-attachments` | |
-| `MCP_ATTACHMENT_R2_TOKEN` | — | Cloudflare API token with R2 write |
+| `MCP_ATTACHMENT_R2_ACCESS_KEY_ID` | — | S3 key pair; when both are set the store speaks S3/SigV4 — **required for a bucket-scoped token**, which the REST API refuses |
+| `MCP_ATTACHMENT_R2_SECRET_ACCESS_KEY` | — | |
+| `MCP_ATTACHMENT_R2_TOKEN` | — | Cloudflare API bearer token; REST fallback when no key pair (needs account-level R2) |
 | `CLOUDFLARE_ACCOUNT_ID` | — | |
 | `MCP_ATTACHMENT_SIGNING_KEY` | random per boot | **set it**, or URLs die at restart |
 | `MCP_ATTACHMENT_BASE_URL` | `http://127.0.0.1:$MCP_PORT` | what goes in the URL |
