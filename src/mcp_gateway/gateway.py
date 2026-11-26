@@ -478,6 +478,11 @@ def load_servers(path: str | Path | None = None) -> dict[str, dict[str, Any]]:
         # (e.g. a Google access token) to a token-consumer upstream.
         if cfg.get('forward_token'):
             entry['forward_token'] = True
+        # Handshake era for this backend ("legacy" skips the server/discover
+        # probe); see _mode_override. Every key an entry keeps has to be
+        # copied here: create_gateway only sees what this builds.
+        if 'mode' in cfg:
+            entry['mode'] = cfg['mode']
         if transport == 'stdio':
             entry['command'] = cfg['command']
             entry['args'] = list(cfg.get('args', []))

@@ -11,6 +11,7 @@ tools then vanish without an error: vm.danenberg.ai's tmux-mcp-rs showed
 from __future__ import annotations
 
 import inspect
+import json
 import sys
 from pathlib import Path
 
@@ -18,7 +19,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.server import create_proxy as fastmcp_create_proxy
 
-from mcp_gateway.gateway import _mode_override, create_gateway
+from mcp_gateway.gateway import _mode_override, create_gateway, load_servers
 
 BACKEND = str(Path(__file__).with_name("_discover_intolerant_backend.py"))
 HAS_ERAS = "mode" in inspect.signature(fastmcp_create_proxy).parameters
@@ -49,6 +50,18 @@ async def test_legacy_mode_lists_and_calls():
         assert "echo" in [t.name for t in await c.list_tools()]
         result = await c.call_tool("echo", {"text": "hi"})
         assert result.content[0].text == "hi"
+
+
+async def test_legacy_mode_survives_servers_json(tmp_path):
+    # The path a deployment takes: a servers.json through load_servers, which
+    # rebuilds every entry from the keys it knows. The first cut of this key
+    # passed the tests above and still did nothing on vm.danenberg.ai,
+    # because load_servers dropped it.
+    f = tmp_path / "servers.json"
+    f.write_text(json.dumps(_servers(mode="legacy")))
+    servers = load_servers(f)
+    assert servers["rmcp"]["mode"] == "legacy"
+    assert "echo" in await _tool_names(create_gateway(servers=servers))
 
 
 @pytest.mark.skipif(not HAS_ERAS, reason="fastmcp 3.x always uses the handshake")
