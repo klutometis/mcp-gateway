@@ -885,6 +885,31 @@ def _proxy_config_for_http(
     }
 
 
+def _mode_override(create_proxy, server_config: dict[str, Any]) -> dict[str, Any]:
+    """`create_proxy` kwargs for a server's configured handshake era, if any.
+
+    ``"mode": "legacy"`` in a server's entry makes the gateway open that
+    backend (every instance of it) with the classic initialize handshake,
+    instead of the gateway-wide "auto", which probes ``server/discover``
+    first. "auto" falls back to the handshake when a backend answers the
+    probe with an error, but some handshake-only servers never answer it:
+    rmcp (the Rust SDK; tmux-mcp-rs 0.2.1 through 0.6.0, checked 2026-11-26)
+    aborts on any request before ``initialize``, so a stdio backend simply
+    exits and its tools vanish. fastmcp 3.x has no eras and always uses the
+    handshake, so there the key changes nothing.
+    """
+    mode = server_config.get("mode")
+    if mode is None:
+        return {}
+    if not isinstance(mode, str):
+        raise ValueError(f"'mode' must be a string such as \"legacy\" or \"auto\", got {mode!r}")
+    try:
+        supported = "mode" in inspect.signature(create_proxy).parameters
+    except (TypeError, ValueError):
+        supported = False
+    return {"mode": mode} if supported else {}
+
+
 def _proxy_target(proxy_config: dict[str, Any]) -> Any:
     """What create_proxy is pointed at for one backing.
 
@@ -1014,6 +1039,7 @@ def _build_single_instance(
     proxy = create_proxy(
         _proxy_target(proxy_config),
         name=f"Proxy-{name}",
+        **_mode_override(create_proxy, server_config),
     )
     # "*" means expose every upstream tool as-is: skip the enable(only=True)
     # subset filter and the rename transform.
@@ -1066,6 +1092,7 @@ def _build_multi_instance(
         backing = create_proxy(
             _proxy_target(proxy_config),
             name=f"Proxy-{name}-{inst_name}",
+            **_mode_override(create_proxy, server_config),
         )
         # "*" exposes every upstream tool as-is (no subset/rename).
         if tool_configs != "*":

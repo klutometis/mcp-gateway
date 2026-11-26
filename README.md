@@ -34,6 +34,12 @@ auth), rather than forked.
 Set `MCP_SERVERS_FILE` to a `servers.json`. Each entry declares a
 transport + tools; an `instances` block turns it multi-instance.
 
+`"mode": "legacy"` on an entry opens that backend with the classic
+initialize handshake. By default the gateway first probes `server/discover`
+and falls back to the handshake on an error, but a handshake-only server
+built on rmcp (the Rust SDK, e.g. tmux-mcp-rs) exits on the probe instead of
+answering it, and its tools silently disappear.
+
 ## Run
 
 ```bash
