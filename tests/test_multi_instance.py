@@ -389,3 +389,45 @@ def _extract_text(result: Any) -> str:
             getattr(item, "text", "") for item in result.content
         )
     return str(result)
+
+
+# ---------------------------------------------------------------------------
+# warm_instances: every backing is reached, not just the first
+# ---------------------------------------------------------------------------
+
+
+class _CountingBacking(FastMCP):
+    """A backing that counts list_tools calls (a stand-in for 'spawned')."""
+
+    def __init__(self, label: str, *, fails: bool = False) -> None:
+        super().__init__(f"backing-{label}")
+        self.listed = 0
+        self.fails = fails
+
+        @self.tool
+        def send(to: str) -> str:
+            """Send."""
+            return f"[{label}] {to}"
+
+    async def list_tools(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+        self.listed += 1
+        if self.fails:
+            raise RuntimeError("down")
+        return await super().list_tools(*args, **kwargs)
+
+
+async def test_warm_instances_reaches_every_backing() -> None:
+    mac, macly = _CountingBacking("mac"), _CountingBacking("macly")
+    proxy = MultiInstanceProxy("studio", {"mac": mac, "macly": macly}, param_name="host")
+    await proxy.list_tools()  # the ordinary surface: stops at the first backing
+    assert mac.listed >= 1 and macly.listed == 0
+    out = await proxy.warm_instances()
+    assert macly.listed >= 1, "the second instance must be started too"
+    assert out == {"mac": "1 tools", "macly": "1 tools"}
+
+
+async def test_warm_instances_survives_a_dead_backing() -> None:
+    dead, live = _CountingBacking("a", fails=True), _CountingBacking("b")
+    proxy = MultiInstanceProxy("x", {"a": dead, "b": live}, param_name="host")
+    out = await proxy.warm_instances()
+    assert out["a"].startswith("RuntimeError") and out["b"] == "1 tools"

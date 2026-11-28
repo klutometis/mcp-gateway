@@ -356,6 +356,26 @@ class MultiInstanceProxy(FastMCP):
         assert last_exc is not None
         raise last_exc
 
+    async def warm_instances(self) -> dict[str, str]:
+        """List tools on every backing, so each one's subprocess starts now.
+
+        ``_fetch_backing_tools`` stops at the first backing that answers,
+        which is right for building the tool surface but leaves every
+        other stdio backing unspawned until its first call. That matters
+        when a backing must be *listening* before anything calls it: a
+        robloxstudio-mcp per Mac waits for that Mac's Studio plugin to
+        dial in, and the plugin cannot dial a port nobody has opened
+        (2026-11-28: host=macly never came up). Returns instance name ->
+        "N tools" or the error, for the warm-up log; never raises.
+        """
+        out: dict[str, str] = {}
+        for inst_name, backing in self._instances.items():
+            try:
+                out[inst_name] = f"{len(await backing.list_tools())} tools"
+            except Exception as e:  # one dead instance must not stop the rest
+                out[inst_name] = f"{type(e).__name__}: {e}"
+        return out
+
     async def _ensure_routing_tools(self) -> dict[str, FunctionTool]:
         """Lazily build the routing-tool registry on first access.
 

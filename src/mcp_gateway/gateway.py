@@ -715,6 +715,10 @@ def create_gateway(
 
     list_deadline = list_deadline_from_env()
 
+    # Multi-instance servers, warmed instance by instance after the pass
+    # above (which reaches only the first instance that answers).
+    multi_instances: list[tuple[str, Any]] = []
+
     for name, server_config in servers.items():
         tool_configs = server_config["tools"]
         transport = server_config["transport"]
@@ -729,6 +733,7 @@ def create_gateway(
                 tool_configs=tool_configs,
                 create_proxy=create_proxy,
             )
+            multi_instances.append((name, mounted))
         else:
             mounted = _build_single_instance(
                 name=name,
@@ -759,6 +764,7 @@ def create_gateway(
 
     # Stash on the gateway for entrypoint code to schedule as a startup hook.
     gateway._warmup_proxies = warmup_proxies  # type: ignore[attr-defined]
+    gateway._warmup_multi_instances = multi_instances  # type: ignore[attr-defined]
 
     return gateway
 
@@ -1151,3 +1157,12 @@ async def warm_proxies(gateway: FastMCP) -> None:
                 f"  WARNING: warm-up of '{name}' failed: {type(e).__name__}: {e}",
                 file=sys.stderr,
             )
+    # Every instance of a multi-instance server, not just the first one that
+    # answered: a stdio instance that must be listening before anyone calls
+    # it (a robloxstudio-mcp waiting for its Studio plugin) only starts here.
+    for name, multi in getattr(gateway, "_warmup_multi_instances", []):
+        warm_instances = getattr(multi, "warm_instances", None)
+        if warm_instances is None:
+            continue
+        for inst, result in (await warm_instances()).items():
+            print(f"  warmed '{name}' instance '{inst}': {result}")
